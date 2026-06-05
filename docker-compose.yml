@@ -10,14 +10,9 @@ services:
     ports:
       - "5432:5432"
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
   backend:
     build: ./backend
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - ./backend:/app
     ports:
@@ -26,18 +21,6 @@ services:
       - .env
     depends_on:
       - db
-      - redis
-
-  worker:
-    build: ./backend
-    command: celery -A backend.tasks.worker.celery_app worker --loglevel=info
-    volumes:
-      - ./backend:/app
-    env_file:
-      - .env
-    depends_on:
-      - db
-      - redis
 
   frontend:
     build: ./frontend

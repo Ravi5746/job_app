@@ -3,11 +3,12 @@ from typing import Dict, Any
 
 def get_analyze_job_prompt(job_description: str, resume_content: str) -> str:
     """
-    Generate prompt for semantic job description and resume comparison.
+    Generate prompt for semantic job description and resume comparison,
+    including key skills and requirements extraction.
     """
     return f"""
-    You are a professional HR recruiter and technical career coach.
-    Compare the following Job Description with the User's Resume.
+    You are a professional HR recruiter, ATS expert, and technical career coach.
+    Analyze the following Job Description and compare it with the User's Resume.
     
     JOB DESCRIPTION:
     {job_description[:3000]}
@@ -18,7 +19,9 @@ def get_analyze_job_prompt(job_description: str, resume_content: str) -> str:
     Provide your analysis in JSON format with exactly these keys:
     "match_score": (integer between 0 and 100),
     "suggestions": (list of 3 specific things to improve in the resume for this job),
-    "technical_alignment": (short description of how skills align)
+    "technical_alignment": (short description of how skills align),
+    "skills": (comma-separated list of top 8 technical skills extracted from the job description),
+    "requirements": (bulleted list of 3-5 key qualifications extracted from the job description)
     """
 
 

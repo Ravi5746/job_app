@@ -44,25 +44,28 @@ async def enrich_job_data(
             if db_job:
                 db_job.description = full_desc
                 
-                # Use AI to extract structured info from the full description
-                try:
-                    extraction = await hermes_agent.extract_job_details(full_desc)
-                    db_job.skills = extraction.get("skills", "Technical Skills")
-                    db_job.requirements = extraction.get("requirements", reqs or "Check job description.")
-                except Exception:
-                    db_job.skills = "Technical Skills"
-                    db_job.requirements = reqs or "Check job description."
-                
-                # AI Matching
+                # Consolidated Details Extraction & Matching
                 resume = db.query(ResumeModel).filter(ResumeModel.user_id == user_id).order_by(ResumeModel.created_at.desc()).first()
                 if resume:
-                    # Calculate dynamic match score
-                    score = await hermes_agent.calculate_match_score(full_desc, resume.content)
-                    db_job.match_score = score
-                    
-                    # Get tailoring suggestions
-                    analysis = await hermes_agent.analyze_job(full_desc, resume.content)
-                    db_job.match_suggestions = "\n".join(analysis.get("suggestions", []))
+                    try:
+                        analysis = await hermes_agent.analyze_job(full_desc, resume.content)
+                        db_job.skills = analysis.get("skills") or "Technical Skills"
+                        db_job.requirements = analysis.get("requirements") or reqs or "Check job description."
+                        db_job.match_score = analysis.get("match_score")
+                        db_job.match_suggestions = "\n".join(analysis.get("suggestions", []))
+                    except Exception as enrich_err:
+                        print(f"Error in consolidated background enrichment for job {job_id}: {enrich_err}")
+                        db_job.skills = "Technical Skills"
+                        db_job.requirements = reqs or "Check job description."
+                else:
+                    # Fallback if no resume exists for user yet
+                    try:
+                        extraction = await hermes_agent.extract_job_details(full_desc)
+                        db_job.skills = extraction.get("skills", "Technical Skills")
+                        db_job.requirements = extraction.get("requirements", reqs or "Check job description.")
+                    except Exception:
+                        db_job.skills = "Technical Skills"
+                        db_job.requirements = reqs or "Check job description."
                 
                 db.commit()
     except Exception as e:
@@ -401,3 +404,4 @@ async def apply_to_job(
     
     print(f"DEBUG: Automation success: {result['message']}")
     return result
+

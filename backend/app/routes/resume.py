@@ -116,27 +116,27 @@ async def scrape_jobs_for_new_resume(resume_id: int, user_id: int, db_session_fa
                     db.commit()
                     db.refresh(db_job)
 
-                    # Calculate ATS score and AI suggestions immediately
+                    # Calculate ATS score, suggestions, skills, and requirements in one pass
                     try:
-                        score = await hermes_agent.calculate_match_score(full_desc, resume.content)
-                        db_job.match_score = score
-                        
                         analysis = await hermes_agent.analyze_job(full_desc, resume.content)
+                        db_job.match_score = analysis.get("match_score")
                         db_job.match_suggestions = "\n".join(analysis.get("suggestions", []))
+                        db_job.skills = analysis.get("skills") or "Technical Skills"
+                        db_job.requirements = analysis.get("requirements") or reqs or "Check job description."
                         db.commit()
                     except Exception as match_err:
                         logger.error(f"Error calculating match score for job {db_job.id}: {match_err}")
                 else:
-                    # Update existing job and calculate match score if missing
+                    # Update existing job and calculate match details in one pass
                     for field, value in job_in.model_dump().items():
                         setattr(existing_job, field, value)
                     
                     try:
-                        score = await hermes_agent.calculate_match_score(full_desc, resume.content)
-                        existing_job.match_score = score
-                        
                         analysis = await hermes_agent.analyze_job(full_desc, resume.content)
+                        existing_job.match_score = analysis.get("match_score")
                         existing_job.match_suggestions = "\n".join(analysis.get("suggestions", []))
+                        existing_job.skills = analysis.get("skills") or existing_job.skills or "Technical Skills"
+                        existing_job.requirements = analysis.get("requirements") or existing_job.requirements or reqs or "Check job description."
                     except Exception as match_err:
                         logger.error(f"Error updating match score for job {existing_job.id}: {match_err}")
                     
@@ -228,7 +228,7 @@ async def upload_resume(
         except Exception as e:
             logger.error(f"Failed to extract/store profile data: {e}")
 
-        # 5. Trigger job scraping in TRUE background (non-blocking)
+        # 5. Trigger job scraping in background (non-blocking)
         background_tasks.add_task(scrape_jobs_for_new_resume, db_resume.id, current_user.id, SessionLocal)
         logger.info(f"Background scraping queued for resume ID {db_resume.id}")
 

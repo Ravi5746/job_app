@@ -112,6 +112,24 @@ def migrate():
             conn.rollback()
             print(f"  [WARN] user_profiles cleanup: {e}")
 
+        # ── Database Indexes ──
+        print("\n=== Database Indexes ===")
+        indexes = [
+            ("ix_applications_user_id", "CREATE INDEX IF NOT EXISTS ix_applications_user_id ON applications(user_id)"),
+            ("ix_applications_job_id", "CREATE INDEX IF NOT EXISTS ix_applications_job_id ON applications(job_id)"),
+            ("ix_applications_resume_id", "CREATE INDEX IF NOT EXISTS ix_applications_resume_id ON applications(resume_id)"),
+            ("ix_resumes_user_id", "CREATE INDEX IF NOT EXISTS ix_resumes_user_id ON resumes(user_id)"),
+        ]
+        for idx_name, create_sql in indexes:
+            try:
+                print(f"  Creating index {idx_name} if not exists...")
+                conn.execute(text(create_sql))
+                conn.commit()
+                print(f"  [OK] Index {idx_name} created.")
+            except Exception as e:
+                conn.rollback()
+                print(f"  [WARN] Index {idx_name} creation failed: {e}")
+
         print("\n=== Migration complete ===")
 
 

@@ -44,15 +44,27 @@ async def disconnect_platform(
     current_user: UserModel = Depends(get_current_user)
 ):
     """
-    Disconnects a platform by removing its marker file.
+    Disconnects a platform by removing its marker file and browser session directory.
     """
     import os
+    import shutil
     user_data_dir = settings.USER_DATA_DIR
     marker_path = os.path.join(user_data_dir, f"connected_{platform.lower()}.txt")
+    platform_dir = os.path.join(user_data_dir, platform.lower())
     
+    deleted = False
     if os.path.exists(marker_path):
         os.remove(marker_path)
-        return {"status": "success", "message": f"Disconnected from {platform}"}
+        deleted = True
+    if os.path.exists(platform_dir):
+        try:
+            shutil.rmtree(platform_dir)
+        except Exception:
+            pass
+        deleted = True
+        
+    if deleted:
+        return {"status": "success", "message": f"Disconnected from {platform} and wiped its session data"}
     return {"status": "error", "message": f"{platform} is not connected"}
 
 @router.post("/disconnect-all")

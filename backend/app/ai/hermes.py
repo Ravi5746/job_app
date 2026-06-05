@@ -135,23 +135,29 @@ class HermesAgent:
         
     async def analyze_job(self, job_description: str, resume_content: str) -> Dict:
         """
-        Analyzes the match between a job and a resume.
+        Analyzes the match between a job and a resume, and extracts key details (skills, requirements).
         Uses OpenRouter for semantic matching, falls back to keyword heuristic.
         """
         if not job_description or not resume_content:
-            return {"match_score": 0, "suggestions": ["Provide both job description and resume for analysis."]}
+            return {
+                "match_score": 0,
+                "suggestions": ["Provide both job description and resume for analysis."],
+                "technical_alignment": "Missing input data.",
+                "skills": "",
+                "requirements": ""
+            }
 
         # Try semantic matching with OpenRouter
         if self.client:
             try:
-                logger.info("Performing semantic matching with OpenRouter...")
+                logger.info("Performing semantic matching and extraction with OpenRouter...")
                 prompt = prompts.get_analyze_job_prompt(job_description, resume_content)
                 
                 response = await self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"},
-                    max_tokens=1000
+                    max_tokens=1500
                 )
                 
                 if not response or not getattr(response, 'choices', None) or len(response.choices) == 0:
@@ -161,6 +167,20 @@ class HermesAgent:
                     raise ValueError("Empty content returned from OpenRouter.")
                 result = json.loads(raw_content)
                 logger.info(f"AI Match Score: {result.get('match_score')}")
+
+                # Ensure result formatting for skills and requirements is robust
+                if "skills" in result:
+                    if isinstance(result["skills"], list):
+                        result["skills"] = ", ".join(result["skills"])
+                else:
+                    result["skills"] = ""
+
+                if "requirements" in result:
+                    if isinstance(result["requirements"], list):
+                        result["requirements"] = "\n".join(result["requirements"])
+                else:
+                    result["requirements"] = ""
+
                 return result
 
             except Exception as e:
@@ -180,10 +200,16 @@ class HermesAgent:
         if boosted_score < 70:
             suggestions.append("Your resume could be better optimized for this specific role.")
         
+        # Extract basic skills for fallback
+        skills_list = re.findall(r'[A-Z][a-z]+(?:\.js|#|\+\+)?', job_description)
+        fallback_skills = ", ".join(list(set(skills_list))[:8]) if skills_list else "Technical Skills"
+        
         return {
             "match_score": boosted_score,
             "suggestions": suggestions,
-            "technical_alignment": "Keyword-based matching performed."
+            "technical_alignment": "Keyword-based matching performed.",
+            "skills": fallback_skills,
+            "requirements": "See description for details."
         }
 
     async def extract_job_details(self, job_description: str) -> Dict:
@@ -218,27 +244,14 @@ class HermesAgent:
     async def calculate_match_score(self, job_description: str, resume_content: str) -> int:
         """
         Calculates a dynamic match score (0-100) between a job and a resume.
+        Delegates to analyze_job to reuse prompt and prevent redundant API calls.
         """
-        if not self.client or not resume_content:
+        if not resume_content:
             return 75 # Fallback
 
         try:
-            prompt = prompts.get_calculate_match_score_prompt(job_description, resume_content)
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=50
-            )
-            if not response or not getattr(response, 'choices', None) or len(response.choices) == 0:
-                raise ValueError("No choices returned from OpenRouter.")
-            raw_content = response.choices[0].message.content
-            if not raw_content:
-                raise ValueError("Empty content returned from OpenRouter.")
-            score_text = raw_content.strip()
-            # Extract only digits
-            import re
-            score = int(re.search(r'\d+', score_text).group())
-            return min(100, max(0, score))
+            analysis = await self.analyze_job(job_description, resume_content)
+            return analysis.get("match_score", 80)
         except Exception:
             return 80 # Default if AI fails
 

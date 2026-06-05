@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     TINYFISH_API_KEY: str = ""
     OPENAI_MODEL: str = "openai/gpt-oss-20b"
 
+    HEADLESS: bool = False
+
     USER_DATA_DIR: str = str(Path.home() / ".job_applied_browser_data")
     SCREENSHOTS_DIR: str = str(Path.home() / ".job_applied_screenshots")
     UPLOAD_DIR: str = str(Path.home() / ".job_applied_uploads")

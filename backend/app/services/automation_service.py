@@ -1,4 +1,5 @@
 import tempfile
+import psutil
 
 from dotenv import load_dotenv
 import asyncio
@@ -1069,14 +1070,24 @@ class AutomationService:
         context = None
         try:
             async with async_playwright() as pw:
-                user_data_dir = settings.USER_DATA_DIR
+                platform_name = "indeed" if is_indeed else "linkedin"
+                user_data_dir = os.path.join(settings.USER_DATA_DIR, platform_name)
                 os.makedirs(user_data_dir, exist_ok=True)
+
+                # Pre-emptively remove stale Chromium SingletonLock file
+                lock_file = os.path.join(user_data_dir, "SingletonLock")
+                if os.path.exists(lock_file):
+                    try:
+                        logger.info("Pre-emptively removing stale browser SingletonLock file")
+                        os.remove(lock_file)
+                    except Exception as e:
+                        logger.warning(f"Could not pre-emptively remove browser SingletonLock: {e}")
 
                 for attempt in range(3):
                     try:
                         context = await pw.chromium.launch_persistent_context(
                             user_data_dir,
-                            headless=False,
+                            headless=settings.HEADLESS,
                             args=[
                                 "--disable-blink-features=AutomationControlled",
                                 "--no-sandbox",
@@ -1096,21 +1107,22 @@ class AutomationService:
                         if attempt == 2:
                             raise
                         logger.warning(f"Browser locked, retry {attempt + 2}/3: {exc}")
-                        # Only kill orphaned processes AFTER a failed launch attempt
-                        if sys.platform == "win32":
-                            try:
-                                import subprocess
-                                subprocess.run(
-                                    'powershell -Command "Get-Process | Where-Object '
-                                    '{ $_.Path -like \'*ms-playwright*\' } | Stop-Process -Force"',
-                                    shell=True,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                )
-                            except Exception as e:
-                                logger.warning(f"Could not kill orphaned chrome processes: {e}")
+                        # Cross-platform process killing using psutil
+                        try:
+                            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                                try:
+                                    proc_name = (proc.info['name'] or '').lower()
+                                    if 'chrome' in proc_name or 'chromium' in proc_name:
+                                        exe_path = (proc.info['exe'] or '').lower()
+                                        if 'ms-playwright' in exe_path:
+                                            logger.info(f"Killing orphaned Playwright browser process: {proc.info['name']} (PID: {proc.info['pid']})")
+                                            proc.kill()
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                        except Exception as kill_err:
+                            logger.warning(f"Could not kill orphaned chrome processes: {kill_err}")
+                        
                         # Remove stale Chromium lock file
-                        lock_file = os.path.join(user_data_dir, "SingletonLock")
                         if os.path.exists(lock_file):
                             try:
                                 os.remove(lock_file)
@@ -1353,8 +1365,17 @@ class AutomationService:
         context = None
         try:
             async with async_playwright() as pw:
-                user_data_dir = settings.USER_DATA_DIR
+                user_data_dir = os.path.join(settings.USER_DATA_DIR, platform.lower())
                 os.makedirs(user_data_dir, exist_ok=True)
+
+                # Pre-emptively remove stale Chromium SingletonLock file
+                lock_file = os.path.join(user_data_dir, "SingletonLock")
+                if os.path.exists(lock_file):
+                    try:
+                        logger.info("Pre-emptively removing stale browser SingletonLock file in login browser")
+                        os.remove(lock_file)
+                    except Exception as e:
+                        logger.warning(f"Could not pre-emptively remove browser SingletonLock in login browser: {e}")
 
                 context = await pw.chromium.launch_persistent_context(
                     user_data_dir,

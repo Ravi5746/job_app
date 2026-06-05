@@ -8,8 +8,6 @@ python-jose[cryptography]
 passlib[bcrypt]
 bcrypt==4.0.1
 python-multipart
-redis
-celery
 langchain
 langgraph
 playwright
@@ -23,3 +21,4 @@ pdfplumber
 
 PyMuPDF
 python-docx
+psutil
