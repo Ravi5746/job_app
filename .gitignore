@@ -1,0 +1,35 @@
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Next.js frontend
+**/node_modules/
+**/.next/
+**/out/
+**/build/
+frontend/.env.local
+frontend/.env*.local
+*.tsbuildinfo
+
+# Python backend
+**/venv/
+**/.venv/
+**/env/
+**/.env
+**/__pycache__/
+**/browser_data/
+**/screenshots/
+**/uploads/
+
+# HTML outputs and temporary test files in backend/scratch
+backend/scratch/*.html
+backend/scratch/*.log
+
+# General logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
