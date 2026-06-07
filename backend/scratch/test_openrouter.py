@@ -12,7 +12,7 @@ with open("d:/automation/Job Applied/backend/.env", "r") as f:
             os.environ[k] = v
 
 def test_tokens(max_tokens):
-    model_name = "google/gemini-2.5-flash"
+    model_name = "openrouter/free"
     api_key = os.environ.get("OPENAI_API_KEY")
     headers = {
         "Authorization": f"Bearer {api_key}",

@@ -22,3 +22,4 @@ pdfplumber
 PyMuPDF
 python-docx
 psutil
+beautifulsoup4

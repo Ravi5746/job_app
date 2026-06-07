@@ -255,6 +255,7 @@ class UserProfileUpdate(BaseModel):
     full_name: str
     email: str
     phone: Optional[str] = None
+    phone_country_code: Optional[str] = None
     location: Optional[str] = None
     linkedin_url: Optional[str] = None
     github_url: Optional[str] = None
@@ -309,6 +310,7 @@ def _build_profile_response(user) -> dict:
         "full_name": user.full_name or "",
         "email": user.email,
         "phone": user.phone or "",
+        "phone_country_code": user.phone_country_code or "",
         "location": user.location or "",
         "linkedin_url": user.linkedin_url or "",
         "github_url": user.github_url or "",
@@ -333,7 +335,7 @@ def _build_profile_response(user) -> dict:
 
     # Calculate profile completeness
     check_fields = [
-        bool(user.full_name), bool(user.phone), bool(user.location),
+        bool(user.full_name), bool(user.phone), bool(user.phone_country_code), bool(user.location),
         bool(user.summary), bool(user.linkedin_url),
         bool(user.skills), bool(user.work_experience),
         bool(user.projects),
@@ -364,6 +366,7 @@ async def update_my_profile(
     current_user.full_name = profile_in.full_name
     current_user.email = profile_in.email
     current_user.phone = profile_in.phone
+    current_user.phone_country_code = profile_in.phone_country_code
     current_user.location = profile_in.location
     current_user.linkedin_url = profile_in.linkedin_url
     current_user.github_url = profile_in.github_url

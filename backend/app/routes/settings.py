@@ -30,7 +30,7 @@ async def connect_platform(
         raise HTTPException(status_code=400, detail="Unsupported platform")
 
     # Launch the browser in a background task so the API responds immediately
-    asyncio.create_task(automation_service.launch_login_browser(platform))
+    asyncio.create_task(automation_service.launch_login_browser(platform, current_user.id))
     
     return {
         "status": "success", 
@@ -48,17 +48,19 @@ async def disconnect_platform(
     """
     import os
     import shutil
-    user_data_dir = settings.USER_DATA_DIR
-    marker_path = os.path.join(user_data_dir, f"connected_{platform.lower()}.txt")
-    platform_dir = os.path.join(user_data_dir, platform.lower())
+    user_platform_dir = os.path.join(settings.USER_DATA_DIR, str(current_user.id), platform.lower())
+    marker_path = os.path.join(user_platform_dir, f"connected_{platform.lower()}.txt")
     
     deleted = False
     if os.path.exists(marker_path):
-        os.remove(marker_path)
-        deleted = True
-    if os.path.exists(platform_dir):
         try:
-            shutil.rmtree(platform_dir)
+            os.remove(marker_path)
+        except Exception:
+            pass
+        deleted = True
+    if os.path.exists(user_platform_dir):
+        try:
+            shutil.rmtree(user_platform_dir)
         except Exception:
             pass
         deleted = True
@@ -77,13 +79,15 @@ async def disconnect_all(
     """
     import os
     import shutil
-    user_data_dir = settings.USER_DATA_DIR
+    user_dir = os.path.join(settings.USER_DATA_DIR, str(current_user.id))
     
-    if os.path.exists(user_data_dir):
-        # We delete the entire folder for a clean slate
-        shutil.rmtree(user_data_dir)
-        os.makedirs(user_data_dir)
-        return {"status": "success", "message": "All platforms disconnected and data wiped"}
+    if os.path.exists(user_dir):
+        try:
+            shutil.rmtree(user_dir)
+            os.makedirs(user_dir, exist_ok=True)
+            return {"status": "success", "message": "All platforms disconnected and data wiped"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to disconnect: {str(e)}"}
     return {"status": "success", "message": "Already disconnected"}
 
 @router.get("/status")
@@ -95,16 +99,19 @@ async def get_connection_status(
     Checks if browser session data exists for various platforms.
     """
     import os
-    user_data_dir = settings.USER_DATA_DIR
     
     status = {}
     platforms = ["linkedin", "indeed", "naukri", "glassdoor"]
     
     for p in platforms:
-        marker_path = os.path.join(user_data_dir, f"connected_{p}.txt")
+        user_platform_dir = os.path.join(settings.USER_DATA_DIR, str(current_user.id), p)
+        marker_path = os.path.join(user_platform_dir, f"connected_{p}.txt")
         if os.path.exists(marker_path):
-            with open(marker_path, "r") as f:
-                status[p] = f.read().strip()
+            try:
+                with open(marker_path, "r") as f:
+                    status[p] = f.read().strip()
+            except Exception:
+                status[p] = p.capitalize()
         else:
             status[p] = False
         

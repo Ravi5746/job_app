@@ -14,6 +14,7 @@ class User(Base):
     
     # Profile fields merged from UserProfile
     phone = Column(String, nullable=True)
+    phone_country_code = Column(String, nullable=True)
     location = Column(String, nullable=True)
     linkedin_url = Column(String, nullable=True)
     github_url = Column(String, nullable=True)

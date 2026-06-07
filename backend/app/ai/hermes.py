@@ -214,7 +214,8 @@ class HermesAgent:
 
     async def extract_job_details(self, job_description: str) -> Dict:
         """
-        Uses AI to extract skills and requirements from a job description.
+        [DEPRECATED] Uses AI to extract skills and requirements from a job description.
+        Deprecated: Use analyze_job instead to get full enrichment in one call.
         """
         if not self.client or not job_description:
             # Fallback to simple extraction
@@ -243,8 +244,8 @@ class HermesAgent:
 
     async def calculate_match_score(self, job_description: str, resume_content: str) -> int:
         """
-        Calculates a dynamic match score (0-100) between a job and a resume.
-        Delegates to analyze_job to reuse prompt and prevent redundant API calls.
+        [DEPRECATED] Calculates a dynamic match score (0-100) between a job and a resume.
+        Deprecated: Use analyze_job instead. Delegates to analyze_job to reuse prompt and prevent redundant API calls.
         """
         if not resume_content:
             return 75 # Fallback
@@ -569,12 +570,15 @@ class HermesAgent:
                 if phone_val:
                     import re
                     clean_phone = re.sub(r"[^\d+]", "", phone_val)
-                    if re.match(r"^\+?\d{7,15}$", clean_phone):
-                        user.phone = clean_phone
+                    if len(clean_phone) > 10:
+                        user.phone = clean_phone[-10:]
+                        user.phone_country_code = clean_phone[:-10]
                     else:
-                        user.phone = phone_val
+                        user.phone = clean_phone
+                        user.phone_country_code = None
                 else:
                     user.phone = None
+                    user.phone_country_code = None
             if "current_location" in profile_data:
                 user.location = profile_data["current_location"]
             elif "location" in profile_data:

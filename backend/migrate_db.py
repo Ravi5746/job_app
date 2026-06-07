@@ -47,6 +47,7 @@ def migrate():
         print("\n=== Users table (profile columns) ===")
         basic_profile_columns = {
             "phone": "VARCHAR",
+            "phone_country_code": "VARCHAR",
             "location": "VARCHAR",
             "linkedin_url": "VARCHAR",
             "github_url": "VARCHAR",
@@ -84,6 +85,31 @@ def migrate():
                 f"ALTER TABLE users ADD COLUMN {col_name} {col_type}"
             )
 
+        # ── Split existing phone numbers into phone and phone_country_code ──
+        print("\n=== Users table (split phone numbers migration) ===")
+        try:
+            rows = conn.execute(text("SELECT id, phone FROM users WHERE phone IS NOT NULL AND phone_country_code IS NULL")).fetchall()
+            for r in rows:
+                user_id = r[0]
+                raw_phone = r[1]
+                if not raw_phone:
+                    continue
+                import re
+                clean_phone = re.sub(r"[^\d+]", "", raw_phone)
+                if len(clean_phone) > 10:
+                    phone_country_code = clean_phone[:-10]
+                    phone_number = clean_phone[-10:]
+                    print(f"  Splitting phone for user {user_id}: {raw_phone} -> code: {phone_country_code}, phone: {phone_number}")
+                    conn.execute(
+                        text("UPDATE users SET phone = :phone, phone_country_code = :code WHERE id = :id"),
+                        {"phone": phone_number, "code": phone_country_code, "id": user_id}
+                    )
+            conn.commit()
+            print("  [OK] Split phone numbers migration completed.")
+        except Exception as e:
+            conn.rollback()
+            print(f"  [WARN] Split phone numbers migration failed: {e}")
+
         # ── Migrate data from user_profiles to users (if table still exists) ──
         print("\n=== Cleanup: user_profiles migration ===")
         try:
@@ -111,6 +137,32 @@ def migrate():
         except Exception as e:
             conn.rollback()
             print(f"  [WARN] user_profiles cleanup: {e}")
+
+        # ── Parse and migrate existing user phone numbers ──
+        print("\n=== Data Migration: phone country codes ===")
+        try:
+            users_res = conn.execute(text("SELECT id, phone FROM users WHERE phone IS NOT NULL AND phone_country_code IS NULL"))
+            users = users_res.fetchall()
+            for u_id, phone_val in users:
+                if phone_val:
+                    # Clean and split
+                    import re
+                    clean_phone = re.sub(r"[^\d+]", "", phone_val)
+                    if re.match(r"^\+?\d{7,15}$", clean_phone) and len(clean_phone) >= 10:
+                        phone_part = clean_phone[-10:]
+                        cc_part = clean_phone[:-10]
+                        if cc_part:
+                            if not cc_part.startswith("+"):
+                                cc_part = "+" + cc_part
+                            conn.execute(
+                                text("UPDATE users SET phone = :phone, phone_country_code = :cc WHERE id = :id"),
+                                {"phone": phone_part, "cc": cc_part, "id": u_id}
+                            )
+            conn.commit()
+            print("  [OK] Existing phone numbers migrated.")
+        except Exception as e:
+            conn.rollback()
+            print(f"  [WARN] Phone data migration: {e}")
 
         # ── Database Indexes ──
         print("\n=== Database Indexes ===")

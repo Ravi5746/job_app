@@ -78,6 +78,102 @@ class AutomationService:
         # Instantiate platform-specific handlers
         self.linkedin_handler = LinkedInHandler(self)
         self.indeed_handler = IndeedHandler(self)
+        
+        # Instantiate DOM Layer
+        from app.services.automation.agent.dom_layer import DOMLayer
+        self._dom = DOMLayer()
+
+        # Cache active browser contexts: {(user_id, platform_name): BrowserContext}
+        self._playwright = None
+        self._active_contexts = {}
+
+    async def _get_playwright(self):
+        if not self._playwright:
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            logger.info("[Browser] Persistent Playwright process started.")
+        return self._playwright
+
+    async def _get_or_create_context(self, user_id: int, platform_name: str):
+        key = (user_id, platform_name)
+        context = self._active_contexts.get(key)
+        
+        if context:
+            try:
+                # Test connection health by accessing pages property
+                context.pages
+                logger.info(f"[Browser] Reusing active browser context for user {user_id} on {platform_name}")
+                return context
+            except Exception as e:
+                logger.warning(f"[Browser] Cached browser context was unhealthy or closed: {e}. Recreating...")
+                self._active_contexts.pop(key, None)
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
+        logger.info(f"[Browser] Launching new persistent context for user {user_id} on {platform_name}")
+        pw = await self._get_playwright()
+        user_data_dir = os.path.join(settings.USER_DATA_DIR, str(user_id), platform_name)
+        os.makedirs(user_data_dir, exist_ok=True)
+
+        # Pre-emptively remove stale Chromium SingletonLock file
+        lock_file = os.path.join(user_data_dir, "SingletonLock")
+        if os.path.exists(lock_file):
+            try:
+                logger.info(f"[Browser] Pre-emptively removing stale browser SingletonLock file for user {user_id}")
+                os.remove(lock_file)
+            except Exception as e:
+                logger.warning(f"[Browser] Could not pre-emptively remove browser SingletonLock: {e}")
+
+        for attempt in range(3):
+            try:
+                context = await pw.chromium.launch_persistent_context(
+                    user_data_dir,
+                    headless=settings.HEADLESS,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-infobars",
+                    ],
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 800},
+                    ignore_default_args=["--enable-automation"],
+                )
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                logger.warning(f"[Browser] Launch attempt failed, retry {attempt + 2}/3: {exc}")
+                # Cross-platform process killing using psutil
+                try:
+                    for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                        try:
+                            proc_name = (proc.info['name'] or '').lower()
+                            if 'chrome' in proc_name or 'chromium' in proc_name:
+                                exe_path = (proc.info['exe'] or '').lower()
+                                if 'ms-playwright' in exe_path:
+                                    logger.info(f"[Browser] Killing orphaned browser process: {proc.info['name']} (PID: {proc.info['pid']})")
+                                    proc.kill()
+                        except (psutil.NoSuchProcess, proc.AccessDenied):
+                            pass
+                except Exception as kill_err:
+                    logger.warning(f"[Browser] Could not kill orphaned chrome processes: {kill_err}")
+                
+                if os.path.exists(lock_file):
+                    try:
+                        os.remove(lock_file)
+                    except Exception:
+                        pass
+                await asyncio.sleep(2)
+
+        self._active_contexts[key] = context
+        return context
 
     # ═══════════════════════════════════════════════════════════════════════
     # PAGE UTILITIES
@@ -118,260 +214,11 @@ class AutomationService:
                 return frame
         return None
 
-
-
     async def _get_active_modal(self, target):
-        """Locate the active, visible modal container in the target (Page or Frame)."""
-        logger.info("[GetActiveModal] Starting search for active modal...")
-        
-        is_frame = hasattr(target, "page")
-        selectors = [
-            ".jobs-easy-apply-modal",
-            ".artdeco-modal",
-            "[role='dialog']",
-            "div[role='region'][aria-label*='progress']",
-            "div[role='region'][aria-label*='application']",
-        ]
-        if is_frame:
-            selectors.extend(["form", "body"])
+        """Delegates modal container location to the DOMLayer class."""
+        return await self._dom.get_active_modal(target)
 
-        for m_sel in selectors:
-            try:
-                locators = target.locator(f"{m_sel}:visible")
-                count = await locators.count()
-                logger.info(f"[GetActiveModal] Selector '{m_sel}': found {count} visible element(s)")
-                for i in range(count):
-                    loc = locators.nth(i)
-                    box = await loc.bounding_box()
-                    logger.info(f"[GetActiveModal]   Element {i}: BoundingBox={box}")
-                    
-                    is_linkedin = "linkedin.com" in target.url.lower()
-                    if is_linkedin and m_sel != ".jobs-easy-apply-modal":
-                        signature_sel = (
-                            "progress, [role='progressbar'], [class*='easy-apply'], "
-                            ".artdeco-completeness-meter-linear, .jobs-easy-apply-footer__info, "
-                            "[data-easy-apply-next-button], .jobs-easy-apply-form-section__grouping"
-                        )
-                        sig_count = await loc.locator(signature_sel).count()
-                        logger.info(
-                            f"[GetActiveModal]   Element {i} checking signatures: "
-                            f"count={sig_count} (selector: '{signature_sel}')"
-                        )
-                        if sig_count == 0:
-                            logger.info(f"[GetActiveModal]   Element {i} rejected (no signature matches)")
-                            continue
-                    logger.info(f"[GetActiveModal] Match found! Selector: '{m_sel}', index: {i}")
-                    return loc
-            except Exception as e:
-                logger.warning(f"[GetActiveModal] Selector '{m_sel}' check failed: {e}")
-                continue
-        logger.info("[GetActiveModal] No active modal found.")
-        return None
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # PHASE 1 — Dynamic HTML Tagging & Minification
-    # ═══════════════════════════════════════════════════════════════════════
-
-    async def _clean_and_tag_modal_html(self, target) -> str:
-        """
-        Uses the Python-validated modal locator from _get_active_modal, then tags
-        and minifies its HTML via element-scoped JS evaluation.
-
-        Playwright passes the actual modal DOM element as the first argument to the
-        JS function, so we never need to re-search for the modal inside JavaScript.
-        This eliminates the race condition where the in-JS isVisible() walk could
-        fail on elements that Playwright's own :visible selector already confirmed.
-        """
-        logger.info("[Scraper] Starting HTML tagging and cleaning...")
-
-        # Re-use the Python-validated locator — no redundant JS modal search needed
-        modal_locator = await self._get_active_modal(target)
-        if not modal_locator:
-            logger.warning("[Scraper] No active modal found — cannot extract HTML.")
-            return ""
-
-        try:
-            html = await modal_locator.evaluate(
-                """(modal) => {
-                    // `modal` is the real DOM element handed in by Playwright.
-                    // No need to search for the modal — we already have it.
-
-                    function isVisible(el) {
-                        if (!el) return false;
-                        if (el.type === 'hidden') return false;
-                        let curr = el;
-                        while (curr && curr !== document.body) {
-                            const style = window.getComputedStyle(curr);
-                            if (style.display === 'none' || style.visibility === 'hidden') return false;
-                            curr = curr.parentElement;
-                        }
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width === 0 && rect.height === 0) return false;
-                        return true;
-                    }
-
-                    // Tag all interactive fields in the live modal with sequential data-qa-idx
-                    const interactiveSelectors = [
-                        "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='file'])",
-                        "textarea",
-                        "select"
-                    ].join(",");
-                    const interactiveElements = Array.from(modal.querySelectorAll(interactiveSelectors));
-
-                    let idx = 1;
-                    interactiveElements.forEach(el => {
-                        if (isVisible(el)) {
-                            el.setAttribute('data-qa-idx', String(idx));
-                            idx++;
-                        } else {
-                            el.removeAttribute('data-qa-idx');
-                        }
-                    });
-                    console.log("[JS Scraper] Tagged " + (idx - 1) + " interactive elements.");
-
-                    // Clone the modal to clean it without affecting the live UI
-                    const clone = modal.cloneNode(true);
-
-                    const tagsToKeep = new Set([
-                        "FORM", "FIELDSET", "LEGEND", "LABEL", "INPUT",
-                        "TEXTAREA", "SELECT", "OPTION", "DIV", "SPAN",
-                        "P", "H1", "H2", "H3", "H4", "H5", "H6"
-                    ]);
-                    const attrsToKeep = new Set([
-                        "id", "name", "type", "value", "placeholder",
-                        "checked", "selected", "required", "aria-label",
-                        "aria-labelledby", "for", "data-qa-idx"
-                    ]);
-
-                    function cleanNode(node) {
-                        if (!node) return;
-
-                        if (node.nodeType !== Node.ELEMENT_NODE) {
-                            if (node.nodeType === Node.TEXT_NODE) {
-                                const text = node.nodeValue.trim();
-                                if (!text) {
-                                    node.parentNode && node.parentNode.removeChild(node);
-                                } else {
-                                    node.nodeValue = text;
-                                }
-                            }
-                            return;
-                        }
-
-                        if (!tagsToKeep.has(node.tagName)) {
-                            node.parentNode && node.parentNode.removeChild(node);
-                            return;
-                        }
-
-                        const styleAttr = node.getAttribute('style') || '';
-                        if (
-                            node.getAttribute('type') === 'hidden' ||
-                            styleAttr.includes('display: none') ||
-                            styleAttr.includes('visibility: hidden') ||
-                            node.hasAttribute('hidden')
-                        ) {
-                            node.parentNode && node.parentNode.removeChild(node);
-                            return;
-                        }
-
-                        const attrs = Array.from(node.attributes);
-                        attrs.forEach(attr => {
-                            if (!attrsToKeep.has(attr.name.toLowerCase())) {
-                                node.removeAttribute(attr.name);
-                            }
-                        });
-
-                        const children = Array.from(node.childNodes);
-                        children.forEach(cleanNode);
-
-                        const containerTags = ["DIV", "SPAN", "P"];
-                        if (containerTags.includes(node.tagName)) {
-                            const hasChildren = node.childNodes.length > 0;
-                            const hasText = node.textContent.trim().length > 0;
-                            if (!hasChildren && !hasText) {
-                                node.parentNode && node.parentNode.removeChild(node);
-                            }
-                        }
-                    }
-
-                    Array.from(clone.childNodes).forEach(cleanNode);
-
-                    const cloneAttrs = Array.from(clone.attributes);
-                    cloneAttrs.forEach(attr => {
-                        if (!attrsToKeep.has(attr.name.toLowerCase())) {
-                            clone.removeAttribute(attr.name);
-                        }
-                    });
-
-                    return clone.outerHTML;
-                }"""
-            )
-            if not html:
-                logger.warning("[Scraper] JS evaluation returned empty string.")
-                return ""
-            logger.info(f"[Scraper] Extracted {len(html):,} chars of modal HTML.")
-            return html
-        except Exception as e:
-            logger.error(f"[Scraper] Error during HTML clean and tag: {e}")
-            return ""
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # PHASE 2 — Single-Pass LLM Answer Generator
-    # ═══════════════════════════════════════════════════════════════════════
-
-    async def _get_single_pass_answers(
-        self,
-        html_content: str,
-        profile_data: dict,
-        resume_text: str,
-    ) -> list[dict]:
-        """
-        Send the minified, tagged HTML along with the user's profile and resume
-        to Gemini Flash in a single pass to identify all form fields, map them to
-        their data-qa-idx values, generate accurate answers, and provide CSS selector fallbacks.
-        Returns a list of answer dicts, each containing qa_idx, label, type, answer, selector.
-        """
-        if not hermes_agent.client:
-            logger.warning("[AI] Hermes (Gemini) client not configured — skipping single-pass AI answering.")
-            return []
-        if not html_content:
-            return []
-
-        system_msg = prompts.SINGLE_PASS_FORM_SYSTEM_MSG
-
-        user_msg = prompts.get_single_pass_answers_user_msg(resume_text, profile_data, html_content)
-
-        try:
-            resp = await hermes_agent.client.chat.completions.create(
-                model=hermes_agent.model_name,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=1000,
-                temperature=0.1,
-            )
-            raw = resp.choices[0].message.content.strip()
-            # Strip any markdown fences the model may have added
-            raw = re.sub(r"^```(?:json)?\s*|```$", "", raw, flags=re.MULTILINE).strip()
-
-            parsed_data = json.loads(raw)
-            if isinstance(parsed_data, dict):
-                answers = parsed_data.get("answers", [])
-            elif isinstance(parsed_data, list):
-                answers = parsed_data
-            else:
-                answers = []
-
-            logger.info(f"[AI] Received {len(answers)} answer(s) from single-pass AI: {answers}")
-            return answers
-        except json.JSONDecodeError as exc:
-            logger.error(f"[AI] JSON parse error: {exc} | snippet: {raw[:400]}")
-            return []
-        except Exception as exc:
-            logger.error(f"[AI] Gemini Flash single-pass call failed: {exc}")
-            return []
 
     # ═══════════════════════════════════════════════════════════════════════
     # PHASE 0 — Pre-download resume from the API
@@ -417,87 +264,7 @@ class AutomationService:
 
 
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # PHASE 2 — Fill contact info
-    # ═══════════════════════════════════════════════════════════════════════
 
-    async def _fill_contact_info(self, target, user_data: dict) -> None:
-        logger.info("[ContactInfo] Filling contact details…")
-        email    = user_data.get("email", "")
-        phone_cc = user_data.get("phone_country_code", "India (+91)")
-        phone    = user_data.get("phone_number") or user_data.get("phone") or ""
-        full_name = user_data.get("full_name", "")
-
-        modal_locator = await self._get_active_modal(target)
-        curr_target = modal_locator if modal_locator else target
-
-        # Fill names if visible (Indeed style)
-        if full_name:
-            names = full_name.split(maxsplit=1)
-            first_name = names[0]
-            last_name = names[1] if len(names) > 1 else ""
-            
-            for sel in ["input[name*='firstName']", "input[name*='first_name']", "input[id*='firstName']"]:
-                try:
-                    el = curr_target.locator(sel).first
-                    if await el.is_visible(timeout=1000):
-                        if not await el.input_value() and first_name:
-                            await el.fill(first_name)
-                        break
-                except Exception:
-                    continue
-            for sel in ["input[name*='lastName']", "input[name*='last_name']", "input[id*='lastName']"]:
-                try:
-                    el = curr_target.locator(sel).first
-                    if await el.is_visible(timeout=1000):
-                        if not await el.input_value() and last_name:
-                            await el.fill(last_name)
-                        break
-                except Exception:
-                    continue
-
-        for sel in ["input[id*='email']", "input[name*='email']", "input[type='email']"]:
-            try:
-                el = curr_target.locator(sel).first
-                if await el.is_visible(timeout=1500):
-                    if not await el.input_value() and email:
-                        await el.fill(email)
-                    break
-            except Exception:
-                continue
-
-        for sel in [
-            "select[id*='phoneCountryCode']",
-            "select[name*='countryCode']",
-            ".fb-dropdown select",
-        ]:
-            try:
-                el = curr_target.locator(sel).first
-                if await el.is_visible(timeout=1500) and phone_cc:
-                    await el.select_option(label=phone_cc)
-                    await target.wait_for_timeout(300)
-                    break
-            except Exception:
-                continue
-
-        for sel in [
-            "input[id*='phoneNumber']",
-            "input[name*='phoneNumber']",
-            "input[type='tel']",
-            "input[name*='phone']",
-            "input[id*='phone']",
-        ]:
-            try:
-                el = curr_target.locator(sel).first
-                if await el.is_visible(timeout=1500) and phone:
-                    await el.triple_click()
-                    await el.fill(str(phone))
-                    await target.wait_for_timeout(300)
-                    break
-            except Exception:
-                continue
-
-        logger.info("[ContactInfo] Done.")
 
     # ═══════════════════════════════════════════════════════════════════════
     # PHASE 3 — Resume upload
@@ -806,176 +573,6 @@ class AutomationService:
             return await fill_radio(el)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # PHASE 4 — AI-powered question answering pipeline
-    # ═══════════════════════════════════════════════════════════════════════
-
-    async def _answer_additional_questions(
-        self,
-        target,
-        profile_data: dict,
-        resume_text: str,
-        resume_file_path: Optional[str] = None,
-    ) -> None:
-        """
-        Complete AI-powered question-answering pipeline using single-pass LLM.
-        1. Clean and tag the active modal HTML (mutating live DOM with data-qa-idx).
-        2. Call Gemini Flash to identify and answer all fields in a single pass.
-        3. Fill fields with React-compatible Playwright interactions.
-        4. Verify that all required fields are filled, and attempt a retry pass if needed.
-        """
-        logger.info("[Questions] ══ AI question-answering pipeline start (Single-Pass) ══")
-
-        await self._wait_for_page_settle(target)
-
-        # ── Step 1: Clean & tag modal HTML ────────────────────────────────
-        html_content = await self._clean_and_tag_modal_html(target)
-        if not html_content:
-            logger.warning("[Questions] Failed to extract modal HTML. Skipping QA.")
-            return
-
-        # ── Step 2: Get answers from Gemini Flash in one pass ─────────────
-        answers = await self._get_single_pass_answers(html_content, profile_data, resume_text)
-        if not answers:
-            logger.warning("[Questions] No answers generated by LLM.")
-            return
-
-        # ── Step 3: Fill every field ──────────────────────────────────────
-        filled_count = 0
-        for ans in answers:
-            ok = await self._fill_field_robust(target, ans)
-            if ok:
-                filled_count += 1
-            await target.wait_for_timeout(100)
-
-        logger.info(f"[Questions] Pass 1 complete — {filled_count}/{len(answers)} fields filled.")
-
-        # ── Step 4: Verify required fields ───────────────────────────────
-        await target.wait_for_timeout(700)
-        try:
-            empty_required = await target.evaluate(
-                """() => {
-                    function isVisible(el) {
-                        if (!el) return false;
-                        let curr = el;
-                        while (curr) {
-                            const style = window.getComputedStyle(curr);
-                            if (style.display === 'none' || style.visibility === 'hidden') return false;
-                            curr = curr.parentElement;
-                        }
-                        return true;
-                    }
-                    const modalSelectors = [".jobs-easy-apply-modal", ".artdeco-modal", "[role='dialog']", "form", "body"];
-                    let modal = null;
-                    for (const sel of modalSelectors) {
-                        const elements = Array.from(document.querySelectorAll(sel));
-                        const visibleEl = elements.find(isVisible);
-                        if (visibleEl) { modal = visibleEl; break; }
-                    }
-                    if (!modal) return [];
-
-                    const fields = Array.from(modal.querySelectorAll("input, textarea, select"));
-                    const empty = [];
-                    const seenRadioGroups = new Set();
-
-                    fields.forEach(el => {
-                        if (!isVisible(el)) return;
-                        const isRequired =
-                            el.hasAttribute('required') ||
-                            el.getAttribute('aria-required') === 'true';
-                        if (!isRequired) return;
-
-                        const type = el.tagName === 'SELECT'
-                            ? 'select'
-                            : (el.type || 'text');
-
-                        if (type === 'radio') {
-                            const name = el.name;
-                            if (name) {
-                                if (seenRadioGroups.has(name)) return;
-                                seenRadioGroups.add(name);
-                                const checked = modal.querySelector(
-                                    `input[type="radio"][name="${CSS.escape(name)}"]:checked`
-                                );
-                                if (!checked) {
-                                    empty.push({
-                                        qa_idx: el.getAttribute('data-qa-idx') || '',
-                                        type: 'radio',
-                                        name: name,
-                                        label: el.id || name
-                                    });
-                                }
-                            } else if (!el.checked) {
-                                empty.push({
-                                    qa_idx: el.getAttribute('data-qa-idx') || '',
-                                    type: 'radio',
-                                    name: '',
-                                    label: el.id || ''
-                                });
-                            }
-                        } else if (type === 'checkbox') {
-                            if (!el.checked) {
-                                empty.push({
-                                    qa_idx: el.getAttribute('data-qa-idx') || '',
-                                    type: 'checkbox',
-                                    name: el.name || '',
-                                    label: el.id || ''
-                                });
-                            }
-                        } else if (type === 'select') {
-                            if (!el.value.trim() || el.value.toLowerCase().includes('select')) {
-                                empty.push({
-                                    qa_idx: el.getAttribute('data-qa-idx') || '',
-                                    type: 'select',
-                                    name: el.name || '',
-                                    label: el.id || ''
-                                });
-                            }
-                        } else {
-                            if (!el.value.trim()) {
-                                empty.push({
-                                    qa_idx: el.getAttribute('data-qa-idx') || '',
-                                    type: type,
-                                    name: el.name || '',
-                                    label: el.id || el.placeholder || ''
-                                });
-                            }
-                        }
-                    });
-                    return empty;
-                }"""
-            )
-        except Exception as exc:
-            logger.warning(
-                f"[Questions] Context destroyed or navigation occurred during verification: {exc}."
-            )
-            return
-
-        # ── Step 5: Retry if empty required fields remain ─────────────────
-        if empty_required:
-            logger.warning(
-                f"[Questions] {len(empty_required)} required field(s) still empty after pass 1: "
-                f"{[f.get('label') or f.get('name') for f in empty_required]} "
-                f"— retrying with updated HTML state..."
-            )
-            html_content_retry = await self._clean_and_tag_modal_html(target)
-            if html_content_retry:
-                retry_answers = await self._get_single_pass_answers(
-                    html_content_retry, profile_data, resume_text
-                )
-                retry_filled = 0
-                for ans in retry_answers:
-                    if any(f.get("qa_idx") == ans.get("qa_idx") for f in empty_required):
-                        ok = await self._fill_field_robust(target, ans)
-                        if ok:
-                            retry_filled += 1
-                        await target.wait_for_timeout(100)
-                logger.info(f"[Questions] Retry pass complete — {retry_filled} field(s) filled.")
-        else:
-            logger.info("[Questions] ✓ All required fields verified filled.")
-
-        logger.info("[Questions] ══ Done ══")
-
-    # ═══════════════════════════════════════════════════════════════════════
     # Navigation helper
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -1013,6 +610,7 @@ class AutomationService:
                 "full_name":              user.full_name or "",
                 "email":                  user.email or "",
                 "phone":                  user.phone or "",
+                "phone_country_code":     user.phone_country_code or "",
                 "location":               user.location or "",
                 "linkedin_url":           user.linkedin_url or "",
                 "github_url":             user.github_url or "",
@@ -1067,253 +665,206 @@ class AutomationService:
 
         logger.info(f"Starting auto-apply: {job.title} @ {job.company}")
 
+        platform_name = "indeed" if is_indeed else "linkedin"
         context = None
+        page = None
         try:
-            async with async_playwright() as pw:
-                platform_name = "indeed" if is_indeed else "linkedin"
-                user_data_dir = os.path.join(settings.USER_DATA_DIR, platform_name)
-                os.makedirs(user_data_dir, exist_ok=True)
+            context = await self._get_or_create_context(user_id, platform_name)
+            page = await context.new_page()
 
-                # Pre-emptively remove stale Chromium SingletonLock file
-                lock_file = os.path.join(user_data_dir, "SingletonLock")
-                if os.path.exists(lock_file):
+            # Anti-detection script
+            await page.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                """
+            )
+
+            # Resolve job URL (convert search/collection URLs to direct job view)
+            target_url = job.url
+            if not is_indeed and "linkedin.com/jobs/search" in target_url.lower():
+                m = re.search(r"currentJobId=(\d+)", target_url)
+                if m:
+                    target_url = f"https://www.linkedin.com/jobs/view/{m.group(1)}/"
+
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as nav_err:
+                logger.warning(f"Navigation soft-failed: {nav_err}")
+
+            await page.wait_for_timeout(4000)
+            await page.evaluate("window.scrollTo(0, 400)")
+            await page.wait_for_timeout(1000)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(1000)
+
+            # If on a LinkedIn search/collection page, click the first job card
+            if not is_indeed and ("jobs/search" in page.url or "jobs/collections" in page.url):
+                for s_sel in [
+                    ".job-card-container",
+                    ".jobs-search-results__list-item",
+                    ".jobs-search-results-list__item",
+                ]:
                     try:
-                        logger.info("Pre-emptively removing stale browser SingletonLock file")
-                        os.remove(lock_file)
-                    except Exception as e:
-                        logger.warning(f"Could not pre-emptively remove browser SingletonLock: {e}")
+                        item = page.locator(s_sel).first
+                        if await item.is_visible(timeout=3000):
+                            await item.click()
+                            await page.wait_for_timeout(3000)
+                            break
+                    except Exception:
+                        continue
 
-                for attempt in range(3):
-                    try:
-                        context = await pw.chromium.launch_persistent_context(
-                            user_data_dir,
-                            headless=settings.HEADLESS,
-                            args=[
-                                "--disable-blink-features=AutomationControlled",
-                                "--no-sandbox",
-                                "--disable-dev-shm-usage",
-                                "--disable-infobars",
-                            ],
-                            user_agent=(
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/124.0.0.0 Safari/537.36"
-                            ),
-                            viewport={"width": 1280, "height": 800},
-                            ignore_default_args=["--enable-automation"],
-                        )
-                        break
-                    except Exception as exc:
-                        if attempt == 2:
-                            raise
-                        logger.warning(f"Browser locked, retry {attempt + 2}/3: {exc}")
-                        # Cross-platform process killing using psutil
-                        try:
-                            for proc in psutil.process_iter(['pid', 'name', 'exe']):
-                                try:
-                                    proc_name = (proc.info['name'] or '').lower()
-                                    if 'chrome' in proc_name or 'chromium' in proc_name:
-                                        exe_path = (proc.info['exe'] or '').lower()
-                                        if 'ms-playwright' in exe_path:
-                                            logger.info(f"Killing orphaned Playwright browser process: {proc.info['name']} (PID: {proc.info['pid']})")
-                                            proc.kill()
-                                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                    pass
-                        except Exception as kill_err:
-                            logger.warning(f"Could not kill orphaned chrome processes: {kill_err}")
-                        
-                        # Remove stale Chromium lock file
-                        if os.path.exists(lock_file):
-                            try:
-                                os.remove(lock_file)
-                            except Exception:
-                                pass
-                        await asyncio.sleep(2)
+            # Get platform-specific handler
+            handler = self.indeed_handler if is_indeed else self.linkedin_handler
 
-                page = context.pages[0] if context.pages else await context.new_page()
+            # Dismiss popups / sign-in walls / cookie consent banners
+            await handler.dismiss_popups(page)
 
-                # Anti-detection script
-                await page.add_init_script(
-                    """
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    window.chrome = { runtime: {} };
-                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                    """
-                )
-
-                # Resolve job URL (convert search/collection URLs to direct job view)
-                target_url = job.url
-                if not is_indeed and "linkedin.com/jobs/search" in target_url.lower():
-                    m = re.search(r"currentJobId=(\d+)", target_url)
-                    if m:
-                        target_url = f"https://www.linkedin.com/jobs/view/{m.group(1)}/"
-
-                try:
-                    await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-                except Exception as nav_err:
-                    logger.warning(f"Navigation soft-failed: {nav_err}")
-
-                await page.wait_for_timeout(4000)
-                await page.evaluate("window.scrollTo(0, 400)")
-                await page.wait_for_timeout(1000)
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(1000)
-
-                # If on a LinkedIn search/collection page, click the first job card
-                if not is_indeed and ("jobs/search" in page.url or "jobs/collections" in page.url):
-                    for s_sel in [
-                        ".job-card-container",
-                        ".jobs-search-results__list-item",
-                        ".jobs-search-results-list__item",
-                    ]:
-                        try:
-                            item = page.locator(s_sel).first
-                            if await item.is_visible(timeout=3000):
-                                await item.click()
-                                await page.wait_for_timeout(3000)
-                                break
-                        except Exception:
-                            continue
-
-                # Get platform-specific handler
-                handler = self.indeed_handler if is_indeed else self.linkedin_handler
-
-                # Dismiss popups / sign-in walls / cookie consent banners
-                await handler.dismiss_popups(page)
-
-                # Guard: Cloudflare or login wall
+            # Guard: Cloudflare or login wall
+            page_content = await page.content()
+            if "Request Blocked" in page_content or "Cloudflare" in page_content:
+                return {"status": "error", "message": "Blocked by Cloudflare. Log in manually first."}
+            
+            # Wait for Cloudflare/Turnstile challenges to be solved (up to 50 seconds in headed browser)
+            for captcha_check in range(5):
                 page_content = await page.content()
-                if "Request Blocked" in page_content or "Cloudflare" in page_content:
-                    return {"status": "error", "message": "Blocked by Cloudflare. Log in manually first."}
-                
-                # Wait for Cloudflare/Turnstile challenges to be solved (up to 50 seconds in headed browser)
-                for captcha_check in range(5):
-                    page_content = await page.content()
-                    if any(kw in page_content.lower() for kw in ["security check", "verify you are human", "hcaptcha", "turnstile"]):
-                        logger.warning("[Apply] Security check / Captcha detected! Waiting 10s for manual resolution in browser...")
-                        await page.wait_for_timeout(10000)
-                    else:
-                        break
+                if any(kw in page_content.lower() for kw in ["security check", "verify you are human", "hcaptcha", "turnstile"]):
+                    logger.warning("[Apply] Security check / Captcha detected! Waiting 10s for manual resolution in browser...")
+                    await page.wait_for_timeout(10000)
+                else:
+                    break
 
-                # Check if session has expired
-                if await handler.is_session_expired(page):
-                    platform_name = "Indeed" if is_indeed else "LinkedIn"
-                    return {"status": "error", "message": f"{platform_name} session expired. Reconnect in Settings."}
+            # Check if session has expired
+            if await handler.is_session_expired(page):
+                platform_name_cap = "Indeed" if is_indeed else "LinkedIn"
+                return {"status": "error", "message": f"{platform_name_cap} session expired. Reconnect in Settings."}
 
-                # ── Locate Easy Apply button ──────────────────────────────────
-                apply_button = await handler.find_apply_button(page)
+            # ── Locate Easy Apply button ──────────────────────────────────
+            apply_button = await handler.find_apply_button(page)
 
-                if not apply_button:
+            if not apply_button:
+                return {
+                    "status": "error",
+                    "message": "Easy Apply button not found after exhaustive search.",
+                }
+
+            # Check if the button text indicates an external redirect (Indeed specific)
+            if is_indeed:
+                btn_text = ""
+                try:
+                    btn_text = (await apply_button.inner_text()).lower()
+                except Exception:
+                    pass
+                if "company site" in btn_text or "employer" in btn_text:
                     return {
-                        "status": "error",
-                        "message": "Easy Apply button not found after exhaustive search.",
+                        "status": "warning",
+                        "message": "External application (Company website) detected. Complete manually.",
+                        "url": job.url,
                     }
 
-                # Check if the button text indicates an external redirect (Indeed specific)
-                if is_indeed:
-                    btn_text = ""
+            original_domain = urlparse(page.url).netloc
+            
+            # Click apply button and handle new tab contexts
+            new_page = None
+            try:
+                async with page.context.expect_page(timeout=4000) as new_page_info:
                     try:
-                        btn_text = (await apply_button.inner_text()).lower()
+                        await apply_button.click()
                     except Exception:
-                        pass
-                    if "company site" in btn_text or "employer" in btn_text:
-                        return {
-                            "status": "warning",
-                            "message": "External application (Company website) detected. Complete manually.",
-                            "url": job.url,
-                        }
+                        await page.evaluate("el => el.click()", apply_button)
+                new_page = await new_page_info.value
+                logger.info("[Apply] Application opened in a new tab.")
+            except Exception as e:
+                logger.info(f"[Apply] No new tab opened (Reason: {type(e).__name__}). Checking redirect or modal...")
 
-                original_domain = urlparse(page.url).netloc
-                
-                # Click apply button and handle new tab contexts
-                new_page = None
-                try:
-                    async with page.context.expect_page(timeout=4000) as new_page_info:
-                        try:
-                            await apply_button.click()
-                        except Exception:
-                            await page.evaluate("el => el.click()", apply_button)
-                    new_page = await new_page_info.value
-                    logger.info("[Apply] Application opened in a new tab.")
-                except Exception as e:
-                    logger.info(f"[Apply] No new tab opened (Reason: {type(e).__name__}). Checking redirect or modal...")
-
-                if new_page:
-                    page = new_page
-                    await self._wait_for_page_settle(page)
-                else:
-                    await self._wait_for_page_settle(page)
-
-                # Wait for platform-specific application interface to appear
-                await handler.wait_for_apply_interface(page)
+            if new_page:
+                page = new_page
+                await self._wait_for_page_settle(page)
+            else:
                 await self._wait_for_page_settle(page)
 
-                # ── Main step loop ────────────────────────────────────────────
-                MAX_STEPS = 15
-                for step_num in range(1, MAX_STEPS + 1):
-                    # Resolve active target context (Page or Frame) and form locator
-                    target, modal_locator = await handler.get_active_target(page)
+            # Wait for platform-specific application interface to appear
+            await handler.wait_for_apply_interface(page)
+            await self._wait_for_page_settle(page)
 
-                    await self._wait_for_page_settle(target)
-                    step_type = await handler.detect_easy_apply_step(target)
-                    logger.info(f"━━ Step {step_num}/{MAX_STEPS}: [{step_type.upper()}] ━━")
+            # ── Set resume path for ToolRegistry ──────────────────────────
+            self._resume_path = resume_file_path
 
-                    if step_type == "success":
-                        job.status = "applied"
-                        db.commit()
+            # ── Instantiate agent components ──────────────────────────────
+            from app.ai.agent_llm import create_llm
+            from app.services.automation.agent.tool_registry import ToolRegistry
+            from app.services.automation.agent.application_agent import ApplicationAgent
+
+            llm = create_llm("smart")
+            tools = ToolRegistry(self._dom, self)
+            agent = ApplicationAgent(
+                llm=llm,
+                dom=self._dom,
+                tools=tools,
+                profile=profile_data,
+                resume_text=resume_text,
+                job_id=job_id,
+                user_id=user_id,
+            )
+
+            # ── Main step loop ────────────────────────────────────────────
+            MAX_STEPS = settings.MAX_FORM_STEPS
+            for step_num in range(1, MAX_STEPS + 1):
+                # Resolve active target context (Page or Frame) and form locator
+                target, modal_locator = await handler.get_active_target(page)
+                await self._wait_for_page_settle(target)
+
+                step_type = await handler.detect_easy_apply_step(target)
+                logger.info(f"━━ Step {step_num}/{MAX_STEPS}: [{step_type.upper()}] ━━")
+
+                if step_type == "success" or agent._state.phase.name == "SUCCESS":
+                    job.status = "applied"
+                    db.commit()
+                    break
+
+                # Delegate core form filling and navigation to ApplicationAgent
+                result = await agent.run_step(target, step_num)
+                status = result.get("status")
+
+                if status == "success":
+                    job.status = "applied"
+                    db.commit()
+                    break
+                elif status == "blocked":
+                    logger.warning(f"Application blocked: {result.get('reason')}")
+                    break
+                elif status == "error":
+                    logger.error(f"Application error: {result.get('message')}")
+                    break
+
+                # If review step and agent completed filling, check if we should review
+                if step_type == "review":
+                    submitted = await handler.handle_review_step(target, modal_locator, db, job)
+                    if submitted:
                         break
 
-                    elif step_type == "contact_info":
-                        await self._fill_contact_info(target, profile_data)
+            # ── External redirect detection ───────────────────────────────
+            redirect_warning = await handler.is_external_redirect(page, original_domain)
+            if redirect_warning:
+                return redirect_warning
 
-                    elif step_type == "resume_upload":
-                        await self._handle_resume_upload(target, resume_file_path)
+            is_success = (job.status == "applied")
 
-                    elif step_type == "questions":
-                        await self._answer_additional_questions(
-                            target,
-                            profile_data,
-                            resume_text,
-                            resume_file_path,
-                        )
+            os.makedirs(settings.SCREENSHOTS_DIR, exist_ok=True)
+            screenshot_path = os.path.join(settings.SCREENSHOTS_DIR, f"job_{job_id}_applied.png")
+            await page.screenshot(path=screenshot_path, full_page=True)
+            await page.wait_for_timeout(5000)
 
-                    elif step_type == "review":
-                        submitted = await handler.handle_review_step(target, modal_locator, db, job)
-                        if submitted:
-                            break
-
-                    elif step_type == "unknown":
-                        logger.warning("Unknown step — attempting blind Next click.")
-
-                    # Advance to next step only after current step is handled
-                    clicked = await handler.click_next_or_review(target)
-                    if not clicked:
-                        logger.warning(
-                            f"No navigation button found on step {step_num}. Stopping."
-                        )
-                        break
-
-                # ── External redirect detection ───────────────────────────────
-                redirect_warning = await handler.is_external_redirect(page, original_domain)
-                if redirect_warning:
-                    return redirect_warning
-
-                is_success = (job.status == "applied")
-
-                os.makedirs(settings.SCREENSHOTS_DIR, exist_ok=True)
-                screenshot_path = os.path.join(settings.SCREENSHOTS_DIR, f"job_{job_id}_applied.png")
-                await page.screenshot(path=screenshot_path, full_page=True)
-                await page.wait_for_timeout(5000)
-
-                return {
-                    "status": "success" if is_success else "partial",
-                    "message": (
-                        "Application submitted and verified!"
-                        if is_success
-                        else "Automation complete — verify result in browser."
-                    ),
-                    "screenshot": screenshot_path,
-                }
+            return {
+                "status": "success" if is_success else "partial",
+                "message": (
+                    "Application submitted and verified!"
+                    if is_success
+                    else "Automation complete — verify result in browser."
+                ),
+                "screenshot": screenshot_path,
+            }
 
         except Exception as exc:
             logger.exception(f"Automation Error: {exc}")
@@ -1321,8 +872,8 @@ class AutomationService:
 
         finally:
             try:
-                if context:
-                    await context.close()
+                if page:
+                    await page.close()
             except Exception:
                 pass
             # Clean up temp resume file
@@ -1336,12 +887,12 @@ class AutomationService:
     # LOGIN BROWSER — used by Settings → Connect Platform
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def launch_login_browser(self, platform: str) -> None:
+    async def launch_login_browser(self, platform: str, user_id: int) -> None:
         """
         Open a persistent Chromium browser to the platform's login page.
 
         This is a lightweight flow — no automation, no form-filling. The user
-        manually logs in; Playwright persists cookies/localStorage in the shared
+        manually logs in; Playwright persists cookies/localStorage in the user's
         `browser_data/` directory so that `apply_to_job` can reuse the
         authenticated session later.
 
@@ -1361,85 +912,95 @@ class AutomationService:
             logger.warning(f"[LoginBrowser] Unknown platform: {platform}")
             return
 
-        logger.info(f"[LoginBrowser] Launching browser for {platform} → {url}")
+        # Close any active cached automation context first to release the lock
+        key = (user_id, platform.lower())
+        cached_context = self._active_contexts.pop(key, None)
+        if cached_context:
+            try:
+                await cached_context.close()
+                logger.info(f"[LoginBrowser] Closed active cached context for user {user_id} on {platform}")
+            except Exception as e:
+                logger.warning(f"[LoginBrowser] Error closing cached context: {e}")
+
+        logger.info(f"[LoginBrowser] Launching browser for user {user_id} on {platform} → {url}")
         context = None
         try:
-            async with async_playwright() as pw:
-                user_data_dir = os.path.join(settings.USER_DATA_DIR, platform.lower())
-                os.makedirs(user_data_dir, exist_ok=True)
+            pw = await self._get_playwright()
+            user_data_dir = os.path.join(settings.USER_DATA_DIR, str(user_id), platform.lower())
+            os.makedirs(user_data_dir, exist_ok=True)
 
-                # Pre-emptively remove stale Chromium SingletonLock file
-                lock_file = os.path.join(user_data_dir, "SingletonLock")
-                if os.path.exists(lock_file):
-                    try:
-                        logger.info("Pre-emptively removing stale browser SingletonLock file in login browser")
-                        os.remove(lock_file)
-                    except Exception as e:
-                        logger.warning(f"Could not pre-emptively remove browser SingletonLock in login browser: {e}")
-
-                context = await pw.chromium.launch_persistent_context(
-                    user_data_dir,
-                    headless=False,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-infobars",
-                    ],
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 800},
-                    ignore_default_args=["--enable-automation"],
-                )
-
-                page = context.pages[0] if context.pages else await context.new_page()
-
-                # Anti-detection
-                await page.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    window.chrome = { runtime: {} };
-                """)
-
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                logger.info(f"[LoginBrowser] Page loaded. Waiting for user to log in…")
-
-                # Wait up to 5 minutes for the user to log in.
-                # Detect success by checking if the URL changed away from the login page.
-                login_keywords = ["login", "signin", "sign-in", "auth", "nlogin"]
-                for _ in range(60):  # 60 × 5s = 5 minutes
-                    await page.wait_for_timeout(5000)
-                    current_url = page.url.lower()
-                    if not any(kw in current_url for kw in login_keywords):
-                        logger.info(f"[LoginBrowser] Login detected — URL: {page.url}")
-                        break
-                else:
-                    logger.warning(f"[LoginBrowser] Timed out waiting for login on {platform}.")
-
-                # Extract user display name if possible (for connected status label)
-                display_name = platform.capitalize()
+            # Pre-emptively remove stale Chromium SingletonLock file
+            lock_file = os.path.join(user_data_dir, "SingletonLock")
+            if os.path.exists(lock_file):
                 try:
-                    if platform == "linkedin":
-                        name_el = page.locator(
-                            ".feed-identity-module__actor-meta a, .global-nav__me-photo"
-                        ).first
-                        if await name_el.count() > 0:
-                            display_name = (
-                                await name_el.get_attribute("alt") or ""
-                            ).strip() or display_name
-                except Exception:
-                    pass
+                    logger.info("Pre-emptively removing stale browser SingletonLock file in login browser")
+                    os.remove(lock_file)
+                except Exception as e:
+                    logger.warning(f"Could not pre-emptively remove browser SingletonLock in login browser: {e}")
 
-                # Write marker file so /settings/status can report "Connected"
-                marker_path = os.path.join(user_data_dir, f"connected_{platform.lower()}.txt")
-                with open(marker_path, "w") as f:
-                    f.write(display_name)
-                logger.info(f"[LoginBrowser] Marker written → {marker_path}")
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-infobars",
+                ],
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                ignore_default_args=["--enable-automation"],
+            )
 
-                # Give the user a moment, then close
-                await page.wait_for_timeout(2000)
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            # Anti-detection
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+            """)
+
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            logger.info(f"[LoginBrowser] Page loaded. Waiting for user to log in…")
+
+            # Wait up to 5 minutes for the user to log in.
+            # Detect success by checking if the URL changed away from the login page.
+            login_keywords = ["login", "signin", "sign-in", "auth", "nlogin"]
+            for _ in range(60):  # 60 × 5s = 5 minutes
+                await page.wait_for_timeout(5000)
+                current_url = page.url.lower()
+                if not any(kw in current_url for kw in login_keywords):
+                    logger.info(f"[LoginBrowser] Login detected — URL: {page.url}")
+                    break
+            else:
+                logger.warning(f"[LoginBrowser] Timed out waiting for login on {platform}.")
+
+            # Extract user display name if possible (for connected status label)
+            display_name = platform.capitalize()
+            try:
+                if platform == "linkedin":
+                    name_el = page.locator(
+                        ".feed-identity-module__actor-meta a, .global-nav__me-photo"
+                    ).first
+                    if await name_el.count() > 0:
+                        display_name = (
+                            await name_el.get_attribute("alt") or ""
+                        ).strip() or display_name
+            except Exception:
+                pass
+
+            # Write marker file so /settings/status can report "Connected"
+            marker_path = os.path.join(user_data_dir, f"connected_{platform.lower()}.txt")
+            with open(marker_path, "w") as f:
+                f.write(display_name)
+            logger.info(f"[LoginBrowser] Marker written → {marker_path}")
+
+            # Give the user a moment, then close
+            await page.wait_for_timeout(2000)
 
         except Exception as exc:
             logger.error(f"[LoginBrowser] Error: {exc}")
