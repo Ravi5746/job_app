@@ -12,6 +12,10 @@ DETERMINISTIC_FIELD_MAP = {
     r"linkedin|linked.?in": "linkedin_url",
     r"github|git.?hub": "github_url",
     r"portfolio|website|sitio": "portfolio_url",
+    r"current.?company|present.?employer|current.?employer": "current_company",
+    r"graduation.?year|year.?of.?graduation|degree.?year|completed.?year": "graduation_year",
+    r"degree.?type|degree.?level|highest.?degree|highest.?qualification|education.?degree": "degree_type",
+    r"employment.?type|job.?type|work.?type|desired.?employment": "employment_type",
 }
 
 
@@ -80,5 +84,46 @@ def _resolve_profile_value(profile: dict, key: str) -> str:
             if country:
                 return f"{country} ({code})"
         return code
+    elif key == "current_company":
+        work_exp = profile.get("work_experience", [])
+        if work_exp and isinstance(work_exp, list):
+            first = work_exp[0]
+            if isinstance(first, dict):
+                return first.get("company", "")
+        return ""
+    elif key in ("current_title", "current_role"):
+        work_exp = profile.get("work_experience", [])
+        if work_exp and isinstance(work_exp, list):
+            first = work_exp[0]
+            if isinstance(first, dict):
+                return first.get("title") or first.get("role") or ""
+        return ""
+    elif key == "graduation_year":
+        edu = profile.get("education", [])
+        if edu and isinstance(edu, list):
+            first = edu[0]
+            if isinstance(first, dict):
+                val = first.get("year") or first.get("end_date") or first.get("end_year") or ""
+                return str(val)
+        return ""
+    elif key == "degree_type":
+        edu = profile.get("education", [])
+        if edu and isinstance(edu, list):
+            first = edu[0]
+            if isinstance(first, dict):
+                return first.get("degree") or first.get("field") or ""
+        return ""
+    elif key == "employment_type":
+        return "Full-time"
+    elif key == "willing_to_relocate":
+        val = profile.get("willing_to_relocate")
+        if val is True:
+            return "Yes"
+        elif val is False:
+            return "No"
+        return ""
+    elif key == "total_years_experience":
+        return str(profile.get("total_years_experience", ""))
     val = profile.get(key)
     return str(val) if val is not None else ""
+

@@ -25,6 +25,9 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: List[str] = ["http://localhost:4000"]
 
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+
     RAPIDAPI_KEY: str = ""
     RAPIDAPI_HOST: str = "jsearch.p.rapidapi.com"
 

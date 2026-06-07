@@ -9,7 +9,7 @@ passlib[bcrypt]
 bcrypt==4.0.1
 python-multipart
 langchain
-langgraph
+langgraph==1.2.4
 playwright
 axios
 python-dotenv
@@ -23,3 +23,9 @@ PyMuPDF
 python-docx
 psutil
 beautifulsoup4
+
+redis==5.0.1
+langgraph-checkpoint-sqlite==3.1.0
+sqlite-vec==0.1.9
+aiosqlite==0.20.0
+sentence-transformers==3.0.1

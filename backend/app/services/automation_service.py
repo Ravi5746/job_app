@@ -100,8 +100,8 @@ class AutomationService:
         
         if context:
             try:
-                # Test connection health by accessing pages property
-                context.pages
+                # Test connection health by performing an RPC
+                await context.cookies()
                 logger.info(f"[Browser] Reusing active browser context for user {user_id} on {platform_name}")
                 return context
             except Exception as e:
@@ -582,12 +582,22 @@ class AutomationService:
     # MAIN ENTRY POINT
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def apply_to_job(self, db: Session, job_id: int, user_id: int):
+    async def apply_to_job(self, db: Session, job_id: int, user_id: int, progress_callback=None):
+        async def report_progress(status: str, msg: str):
+            logger.info(f"[Progress] {status}: {msg}")
+            if progress_callback:
+                try:
+                    await progress_callback(status, msg)
+                except Exception as cb_err:
+                    logger.warning(f"Failed to execute progress callback: {cb_err}")
+
         job = db.query(JobModel).filter(JobModel.id == job_id).first()
         if not job:
             return {"status": "error", "message": "Critical: Job record not found in database."}
         if job.status == "applied":
             return {"status": "error", "message": "Already applied: job is already marked 'applied'."}
+
+        await report_progress("STARTED", f"Initializing application for {job.title} at {job.company}")
 
         resume = (
             db.query(ResumeModel)
@@ -636,6 +646,7 @@ class AutomationService:
 
         # Fallback: if no enriched data exists, extract from resume on-the-fly
         if not profile_data.get("full_name") and resume:
+            await report_progress("EXTRACTING_PROFILE", "No profile found, extracting from resume...")
             logger.info("No stored profile found, extracting from resume...")
             profile_data = await hermes_agent.extract_profile_data(resume.content)
             await hermes_agent.store_user_profile(db, user_id, profile_data)
@@ -669,6 +680,7 @@ class AutomationService:
         context = None
         page = None
         try:
+            await report_progress("LAUNCHING_BROWSER", f"Launching browser context for {platform_name.upper()}...")
             context = await self._get_or_create_context(user_id, platform_name)
             page = await context.new_page()
 
@@ -688,6 +700,7 @@ class AutomationService:
                 if m:
                     target_url = f"https://www.linkedin.com/jobs/view/{m.group(1)}/"
 
+            await report_progress("NAVIGATING", f"Navigating to job details page...")
             try:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             except Exception as nav_err:
@@ -730,6 +743,7 @@ class AutomationService:
             for captcha_check in range(5):
                 page_content = await page.content()
                 if any(kw in page_content.lower() for kw in ["security check", "verify you are human", "hcaptcha", "turnstile"]):
+                    await report_progress("CAPTCHA_DETECTED", "Security check detected. Waiting for manual resolution...")
                     logger.warning("[Apply] Security check / Captcha detected! Waiting 10s for manual resolution in browser...")
                     await page.wait_for_timeout(10000)
                 else:
@@ -741,6 +755,7 @@ class AutomationService:
                 return {"status": "error", "message": f"{platform_name_cap} session expired. Reconnect in Settings."}
 
             # ── Locate Easy Apply button ──────────────────────────────────
+            await report_progress("FINDING_BUTTON", "Locating the Easy Apply button on page...")
             apply_button = await handler.find_apply_button(page)
 
             if not apply_button:
@@ -785,6 +800,7 @@ class AutomationService:
                 await self._wait_for_page_settle(page)
 
             # Wait for platform-specific application interface to appear
+            await report_progress("WAITING_INTERFACE", "Opening application form...")
             await handler.wait_for_apply_interface(page)
             await self._wait_for_page_settle(page)
 
@@ -808,45 +824,67 @@ class AutomationService:
                 user_id=user_id,
             )
 
-            # ── Main step loop ────────────────────────────────────────────
-            MAX_STEPS = settings.MAX_FORM_STEPS
-            for step_num in range(1, MAX_STEPS + 1):
-                # Resolve active target context (Page or Frame) and form locator
-                target, modal_locator = await handler.get_active_target(page)
-                await self._wait_for_page_settle(target)
+            try:
+                logger.info("[Apply] Launching LangGraph agent flow...")
+                result = await agent.run(page, db, handler, self)
+                logger.info(f"[Apply] LangGraph agent execution completed: {result}")
+            except Exception as lg_exc:
+                logger.exception(f"[Apply] LangGraph initialization or execution failed: {lg_exc}. Falling back to Classic Agent...")
+                await report_progress("FALLBACK", "LangGraph error. Executing fallback classical loop...")
+                
+                # FALLBACK to Classic loop
+                from app.services.automation.agent.classic_agent import ClassicApplicationAgent
+                classic_agent = ClassicApplicationAgent(
+                    llm=llm,
+                    dom=self._dom,
+                    tools=tools,
+                    profile=profile_data,
+                    resume_text=resume_text,
+                    job_id=job_id,
+                    user_id=user_id,
+                )
+                
+                # ── Fallback Step loop ──
+                MAX_STEPS = settings.MAX_FORM_STEPS
+                for step_num in range(1, MAX_STEPS + 1):
+                    target, modal_locator = await handler.get_active_target(page)
+                    await self._wait_for_page_settle(target)
 
-                step_type = await handler.detect_easy_apply_step(target)
-                logger.info(f"━━ Step {step_num}/{MAX_STEPS}: [{step_type.upper()}] ━━")
+                    step_type = await handler.detect_easy_apply_step(target)
+                    logger.info(f"━━ Fallback Step {step_num}/{MAX_STEPS}: [{step_type.upper()}] ━━")
+                    await report_progress("FILLING_FORM", f"Processing step {step_num}/{MAX_STEPS}: {step_type.upper()}")
 
-                if step_type == "success" or agent._state.phase.name == "SUCCESS":
-                    job.status = "applied"
-                    db.commit()
-                    break
-
-                # Delegate core form filling and navigation to ApplicationAgent
-                result = await agent.run_step(target, step_num)
-                status = result.get("status")
-
-                if status == "success":
-                    job.status = "applied"
-                    db.commit()
-                    break
-                elif status == "blocked":
-                    logger.warning(f"Application blocked: {result.get('reason')}")
-                    break
-                elif status == "error":
-                    logger.error(f"Application error: {result.get('message')}")
-                    break
-
-                # If review step and agent completed filling, check if we should review
-                if step_type == "review":
-                    submitted = await handler.handle_review_step(target, modal_locator, db, job)
-                    if submitted:
+                    if step_type == "success" or classic_agent._state.phase.name == "SUCCESS":
+                        job.status = "applied"
+                        db.commit()
                         break
+
+                    result = await classic_agent.run_step(target, step_num)
+                    status = result.get("status")
+
+                    if status == "success":
+                        job.status = "applied"
+                        db.commit()
+                        break
+                    elif status == "blocked":
+                        logger.warning(f"Application blocked: {result.get('reason')}")
+                        await report_progress("BLOCKED", f"Application blocked: {result.get('reason')}")
+                        break
+                    elif status == "error":
+                        logger.error(f"Application error: {result.get('message')}")
+                        await report_progress("ERROR", f"Application error: {result.get('message')}")
+                        break
+
+                    if step_type == "review":
+                        await report_progress("REVIEWING", "Reviewing answers and submitting...")
+                        submitted = await handler.handle_review_step(target, modal_locator, db, job)
+                        if submitted:
+                            break
 
             # ── External redirect detection ───────────────────────────────
             redirect_warning = await handler.is_external_redirect(page, original_domain)
             if redirect_warning:
+                await report_progress("REDIRECTED", "Redirected to external platform.")
                 return redirect_warning
 
             is_success = (job.status == "applied")
@@ -855,6 +893,11 @@ class AutomationService:
             screenshot_path = os.path.join(settings.SCREENSHOTS_DIR, f"job_{job_id}_applied.png")
             await page.screenshot(path=screenshot_path, full_page=True)
             await page.wait_for_timeout(5000)
+
+            await report_progress(
+                "SUCCESS" if is_success else "PARTIAL",
+                "Application submitted successfully!" if is_success else "Application flow completed partially."
+            )
 
             return {
                 "status": "success" if is_success else "partial",
@@ -868,6 +911,7 @@ class AutomationService:
 
         except Exception as exc:
             logger.exception(f"Automation Error: {exc}")
+            await report_progress("ERROR", f"Automation Error: {exc}")
             return {"status": "error", "message": f"Automation Error: {exc}"}
 
         finally:

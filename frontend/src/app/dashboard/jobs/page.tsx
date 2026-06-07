@@ -274,28 +274,62 @@ function JobsContent() {
       setIsApplying(true);
       const response = await api.post(`/jobs/apply/${jobId}`);
       const data = response.data;
-      if (data.status === 'success') {
-        alert(`🎉 Success: ${data.message || 'Application submitted and verified!'}`);
-        fetchJobs();
-        if (selectedJob && selectedJob.id === jobId) {
-          setSelectedJob(prev => prev ? { ...prev, status: 'applied' } : null);
-        }
-      } else if (data.status === 'warning') {
-        alert(`⚠️ Warning: ${data.message}\n\nPlease complete manually at the opened URL.`);
-        if (data.url) {
-          window.open(data.url, '_blank', 'noopener,noreferrer');
-        }
-      } else if (data.status === 'partial') {
-        alert(`ℹ️ Partial Success: ${data.message || 'Automation completed but status is unverified.'}`);
-        fetchJobs();
+      
+      if (data.status === 'queued' && data.task_id) {
+        const taskId = data.task_id;
+        const pollInterval = setInterval(async () => {
+          try {
+            const statusRes = await api.get(`/jobs/apply/status/${taskId}`);
+            const statusData = statusRes.data;
+            const state = statusData.status;
+            
+            if (['SUCCESS', 'COMPLETED', 'WARNING', 'FAILURE', 'FAILED'].includes(state)) {
+              clearInterval(pollInterval);
+              setApplyingJobId(null);
+              setIsApplying(false);
+              
+              const result = statusData.result || {};
+              if (state === 'SUCCESS' || state === 'COMPLETED') {
+                alert(`🎉 Success: ${result.message || 'Application submitted and verified!'}`);
+                if (selectedJob && selectedJob.id === jobId) {
+                  setSelectedJob(prev => prev ? { ...prev, status: 'applied' } : null);
+                }
+              } else if (state === 'WARNING') {
+                alert(`⚠️ Warning: ${result.message || 'Check the application status manually.'}`);
+              } else {
+                alert(`❌ Failed: ${result.message || 'Automation failed.'}`);
+              }
+              fetchJobs();
+            }
+          } catch (pollErr) {
+            console.error('Polling error:', pollErr);
+            clearInterval(pollInterval);
+            setApplyingJobId(null);
+            setIsApplying(false);
+            alert('Error occurred while checking application status.');
+          }
+        }, 2000);
       } else {
-        alert(`Status: ${data.message || 'Automation run complete.'}`);
+        if (data.status === 'success') {
+          alert(`🎉 Success: ${data.message || 'Application submitted and verified!'}`);
+          if (selectedJob && selectedJob.id === jobId) {
+            setSelectedJob(prev => prev ? { ...prev, status: 'applied' } : null);
+          }
+        } else if (data.status === 'warning') {
+          alert(`⚠️ Warning: ${data.message}\n\nPlease complete manually at the opened URL.`);
+          if (data.url) {
+            window.open(data.url, '_blank', 'noopener,noreferrer');
+          }
+        } else {
+          alert(`Status: ${data.message || 'Automation run complete.'}`);
+        }
         fetchJobs();
+        setApplyingJobId(null);
+        setIsApplying(false);
       }
     } catch (error: any) {
       console.error('Auto apply failed:', error);
       alert(error.response?.data?.detail || 'Failed to auto-apply to the job.');
-    } finally {
       setApplyingJobId(null);
       setIsApplying(false);
     }

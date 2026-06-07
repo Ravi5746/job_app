@@ -97,6 +97,7 @@ interface ProfileData {
   full_name: string;
   email: string;
   phone: string;
+  phone_country_code?: string;
   location: string;
   linkedin_url: string;
   github_url: string;
@@ -187,6 +188,7 @@ export default function SettingsPage() {
     const checkFields = [
       !!prof.full_name,
       !!prof.phone,
+      !!prof.phone_country_code,
       !!prof.location,
       !!prof.summary,
       !!prof.linkedin_url,
@@ -666,7 +668,37 @@ export default function SettingsPage() {
                         </div>
                         <div>
                           <label className={labelClass}>Phone Number</label>
-                          <input type="tel" value={profile.phone || ''} onChange={e => setProfile({ ...profile, phone: e.target.value })} className={inputClass} />
+                          <div className="flex space-x-2">
+                            <select
+                              value={profile.phone_country_code || ""}
+                              onChange={e => setProfile({ ...profile, phone_country_code: e.target.value })}
+                              className={`${inputClass} !w-24 shrink-0`}
+                            >
+                              <option value="">Code</option>
+                              <option value="+91">🇮🇳 +91</option>
+                              <option value="+1">🇺🇸/🇨🇦 +1</option>
+                              <option value="+44">🇬🇧 +44</option>
+                              <option value="+61">🇦🇺 +61</option>
+                              <option value="+971">🇦🇪 +971</option>
+                              <option value="+49">🇩🇪 +49</option>
+                              <option value="+33">🇫🇷 +33</option>
+                              <option value="+81">🇯🇵 +81</option>
+                              <option value="+65">🇸🇬 +65</option>
+                              <option value="+86">🇨🇳 +86</option>
+                            </select>
+                            <input
+                              type="tel"
+                              placeholder="10-digit mobile"
+                              value={profile.phone || ""}
+                              onChange={e => {
+                                const val = e.target.value.replace(/\D/g, "");
+                                if (val.length <= 10) {
+                                  setProfile({ ...profile, phone: val });
+                                }
+                              }}
+                              className={inputClass}
+                            />
+                          </div>
                         </div>
                         <div>
                           <label className={labelClass}>Location</label>

@@ -9,7 +9,7 @@ This file tracks all tasks, optimizations, and TODOs identified in the [AI_AUTOM
 - [x] **Support Headless Mode in Production**: Add `HEADLESS` environment variable, configure it in `config.py`/`Dockerfile`, and pass it to Playwright browser context launch.
 
 ## P1 (Important) — Architecture & Performance
-- [x] **Activate Celery Worker for Automation**: Migrate heavy browser automation tasks (e.g., `apply_to_job` and `scrape_jobs_for_new_resume`) from FastAPI `BackgroundTasks` to Celery workers to isolate Playwright memory footprints and prevent ASGI server blockage/OOMs.
+- [x] **In-Process Background Task Execution (No Celery/Redis)**: Run all automation and enrichment tasks in-process utilizing FastAPI's `BackgroundTasks` thread pool, avoiding Redis/Celery operational overhead per user request.
 - [x] **Add Missing DB Indexes**: Add database indexes to foreign keys (`user_id`, `job_id`) in the `Application` and `Resume` models to prevent slow sequential scans as the tables grow.
 - [x] **Clean Platform Disconnections**: Ensure platform disconnection routes correctly clean up browser user-data directories and platform status marker files.
 

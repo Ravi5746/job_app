@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timezone
+import asyncio
+import logging
 from app.db.session import get_db, SessionLocal
 
 from app.models.job import Job as JobModel
@@ -14,6 +16,10 @@ from app.services.automation_service import automation_service
 from app.models.resume import Resume as ResumeModel
 from app.routes.auth import get_current_user
 from app.models.user import User as UserModel
+from app.celery_app import apply_to_job_task, AsyncResult, _tasks
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -396,12 +402,68 @@ async def apply_to_job(
             job.match_score = analysis.get("match_score")
             db.commit()
 
-    print(f"DEBUG: Starting automation for job {job_id}")
-    result = await automation_service.apply_to_job(db, job_id, current_user.id)
-    if result["status"] == "error":
-        print(f"DEBUG: Automation error: {result['message']}")
-        raise HTTPException(status_code=400, detail=result["message"])
+    print(f"DEBUG: Enqueuing automation for job {job_id}")
+    task = apply_to_job_task.delay(job_id, current_user.id)
+    return {"status": "queued", "task_id": task.id}
+
+
+@router.get("/apply/status/{task_id}")
+def get_apply_status(task_id: str):
+    res = AsyncResult(task_id)
+    state = res.state
     
-    print(f"DEBUG: Automation success: {result['message']}")
-    return result
+    result_data = None
+    if state in ["COMPLETED", "SUCCESS", "FAILED", "FAILURE", "WARNING"]:
+        info = res.info
+        result_data = {"status": "success" if state in ["COMPLETED", "SUCCESS", "WARNING"] else "error", "message": info.get("message") if info else ""}
+            
+    return {
+        "task_id": task_id,
+        "status": state,
+        "result": result_data
+    }
+
+
+@router.websocket("/apply/ws/{task_id}")
+async def apply_ws_endpoint(websocket: WebSocket, task_id: str):
+    await websocket.accept()
+    
+    res = AsyncResult(task_id)
+    initial_meta = res.info if isinstance(res.info, dict) else {"message": str(res.info)} if res.info else {}
+    await websocket.send_json({
+        "task_id": task_id,
+        "status": res.state,
+        "message": initial_meta.get("message", "Task is in progress...") if res.state not in ["SUCCESS", "COMPLETED"] else "Application completed."
+    })
+    
+    last_message_count = 0
+    try:
+        while True:
+            task = _tasks.get(task_id)
+            if task:
+                messages = task.get("messages", [])
+                if len(messages) > last_message_count:
+                    for i in range(last_message_count, len(messages)):
+                        msg = messages[i]
+                        await websocket.send_json({
+                            "task_id": task_id,
+                            "status": msg["status"],
+                            "message": msg["message"]
+                        })
+                    last_message_count = len(messages)
+            
+            state = res.state
+            if state in ["COMPLETED", "FAILED", "SUCCESS", "FAILURE", "WARNING"]:
+                await websocket.send_json({
+                    "task_id": task_id,
+                    "status": state,
+                    "message": "Task completed."
+                })
+                break
+                
+            await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client disconnected for task {task_id}")
+    except Exception as ws_err:
+        logger.error(f"WebSocket error for task {task_id}: {ws_err}")
 
