@@ -1,12 +1,12 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { 
-  Globe, 
-  Briefcase, 
-  Building2, 
-  CheckCircle2, 
-  AlertCircle, 
+import {
+  Globe,
+  Briefcase,
+  Building2,
+  CheckCircle2,
+  AlertCircle,
   ExternalLink,
   ShieldCheck,
   User,
@@ -24,7 +24,9 @@ import {
   Plus,
   Save,
   CheckCircle,
-  Edit3
+  Edit3,
+  MapPin,
+  Users
 } from 'lucide-react';
 import api from '@/services/api';
 
@@ -113,7 +115,18 @@ interface ProfileData {
   expected_salary: string;
   notice_period: string;
   work_authorization: string;
+  requires_sponsorship?: boolean;
+  country_of_citizenship?: string;
   willing_to_relocate: boolean | null;
+  preferred_work_models?: string[];
+  gender?: string;
+  disability_status?: string;
+  address_line_1?: string;
+  address_line_2?: string;
+  city?: string;
+  state_province?: string;
+  postal_code?: string;
+  country?: string;
   questionnaire: QuestionAnswer[];
   completeness: number;
 }
@@ -123,11 +136,11 @@ export default function SettingsPage() {
   const [connecting, setConnecting] = useState<string | null>(null);
   const [status, setStatus] = useState<{ type: 'success' | 'error', message: string } | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<Record<string, string | boolean>>({});
-  
+
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileSaving, setProfileSaving] = useState(false);
-  
+
   const [customQuestion, setCustomQuestion] = useState('');
   const [newSkill, setNewSkill] = useState('');
   const [editingExpIdx, setEditingExpIdx] = useState<number | null>(null);
@@ -135,6 +148,8 @@ export default function SettingsPage() {
   const [editingCertIdx, setEditingCertIdx] = useState<number | null>(null);
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     contact: true,
+    address: false,
+    demographics: false,
     skills: true,
     experience: false,
     education: false,
@@ -209,7 +224,7 @@ export default function SettingsPage() {
     const cleanSalary = salary.replace(/,/g, '').replace(/ /g, '').trim();
     const num = parseInt(cleanSalary);
     if (isNaN(num) || num <= 0) return '';
-    
+
     if (num >= 10000000) {
       return `(₹ ${(num / 10000000).toFixed(2)} Crore LPA)`;
     } else if (num >= 100000) {
@@ -447,47 +462,45 @@ export default function SettingsPage() {
 
       {/* Tabs navigation */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        
+
         {/* Sidebar Nav */}
         <div className="lg:col-span-1 space-y-3">
-          <button 
+          <button
             onClick={() => {
               setActiveTab('platforms');
               setStatus(null);
             }}
-            className={`w-full flex items-center space-x-3 px-4 py-3 rounded-xl transition-all font-bold border-2 text-sm ${
-              activeTab === 'platforms' 
-                ? 'bg-zinc-900 text-white border-zinc-950 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)]' 
-                : 'text-zinc-600 border-transparent hover:bg-zinc-100 hover:text-zinc-900'
-            }`}
+            className={`w-full flex items-center space-x-3 px-4 py-3 rounded-xl transition-all font-bold border-2 text-sm ${activeTab === 'platforms'
+              ? 'bg-zinc-900 text-white border-zinc-950 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)]'
+              : 'text-zinc-600 border-transparent hover:bg-zinc-100 hover:text-zinc-900'
+              }`}
           >
             <Globe className="w-5 h-5" />
             <span>Platform Connections</span>
           </button>
-          <button 
+          <button
             onClick={() => {
               setActiveTab('profile');
               setStatus(null);
               fetchProfile();
             }}
-            className={`w-full flex items-center space-x-3 px-4 py-3 rounded-xl transition-all font-bold border-2 text-sm ${
-              activeTab === 'profile' 
-                ? 'bg-zinc-900 text-white border-zinc-950 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)]' 
-                : 'text-zinc-600 border-transparent hover:bg-zinc-100 hover:text-zinc-900'
-            }`}
+            className={`w-full flex items-center space-x-3 px-4 py-3 rounded-xl transition-all font-bold border-2 text-sm ${activeTab === 'profile'
+              ? 'bg-zinc-900 text-white border-zinc-950 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)]'
+              : 'text-zinc-600 border-transparent hover:bg-zinc-100 hover:text-zinc-900'
+              }`}
           >
             <User className="w-5 h-5" />
             <span>Profile Settings</span>
           </button>
-          <button 
-            disabled 
+          <button
+            disabled
             className="w-full flex items-center space-x-3 px-4 py-3 text-zinc-400 cursor-not-allowed rounded-xl font-bold text-sm border-2 border-transparent"
           >
             <Bell className="w-5 h-5" />
             <span>Notifications</span>
           </button>
-          <button 
-            disabled 
+          <button
+            disabled
             className="w-full flex items-center space-x-3 px-4 py-3 text-zinc-400 cursor-not-allowed rounded-xl font-bold text-sm border-2 border-transparent"
           >
             <Lock className="w-5 h-5" />
@@ -498,7 +511,7 @@ export default function SettingsPage() {
         {/* Main Content */}
         <div className="lg:col-span-2 space-y-6">
           <div className="bg-white rounded-[2rem] border-2 border-zinc-950 p-8 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
-            
+
             {activeTab === 'platforms' ? (
               <>
                 <div className="mb-8">
@@ -507,7 +520,7 @@ export default function SettingsPage() {
                       <h2 className="text-2xl font-black text-zinc-950 uppercase tracking-tight">Platform Connections</h2>
                       <p className="text-sm text-zinc-600 font-semibold mt-1">Connect your professional accounts to enable one-click AI job applications.</p>
                     </div>
-                    <button 
+                    <button
                       onClick={handleDisconnectAll}
                       className="flex items-center space-x-2 px-4 py-2 text-xs font-black text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 rounded-xl transition-all border-2 border-red-200 cursor-pointer shadow-[2px_2px_0px_0px_rgba(220,38,38,0.2)] hover:translate-y-[-1px]"
                     >
@@ -518,9 +531,8 @@ export default function SettingsPage() {
                 </div>
 
                 {status && (
-                  <div className={`mb-6 p-4 rounded-2xl flex items-center space-x-3 border-2 ${
-                    status.type === 'success' ? 'bg-emerald-50 border-emerald-950 text-emerald-900' : 'bg-red-50 border-red-950 text-red-900'
-                  }`}>
+                  <div className={`mb-6 p-4 rounded-2xl flex items-center space-x-3 border-2 ${status.type === 'success' ? 'bg-emerald-50 border-emerald-950 text-emerald-900' : 'bg-red-50 border-red-950 text-red-900'
+                    }`}>
                     {status.type === 'success' ? <CheckCircle2 className="w-5 h-5 text-emerald-600" /> : <AlertCircle className="w-5 h-5 text-red-600" />}
                     <p className="font-bold text-sm">{status.message}</p>
                   </div>
@@ -528,7 +540,7 @@ export default function SettingsPage() {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   {platforms.map((platform) => (
-                    <div 
+                    <div
                       key={platform.id}
                       className={`p-6 rounded-[1.5rem] border-2 border-zinc-950 bg-white transition-all shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] hover:translate-y-[-2px] group`}
                     >
@@ -540,13 +552,12 @@ export default function SettingsPage() {
                           <button
                             onClick={() => handleConnect(platform.id)}
                             disabled={connecting !== null}
-                            className={`flex items-center justify-center space-x-2 px-4 py-2 rounded-xl text-xs font-black transition-all border-2 border-zinc-950 shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] active:shadow-[1px_1px_0px_0px_rgba(0,0,0,1)] cursor-pointer ${
-                              connectionStatus[platform.id]
-                                ? 'bg-emerald-500 text-white shadow-none cursor-default active:translate-x-0 active:translate-y-0'
-                                : connecting === platform.id
-                                  ? 'bg-zinc-100 text-zinc-400 border-zinc-300 shadow-none cursor-not-allowed'
-                                  : 'bg-zinc-900 text-white hover:bg-zinc-800'
-                            }`}
+                            className={`flex items-center justify-center space-x-2 px-4 py-2 rounded-xl text-xs font-black transition-all border-2 border-zinc-950 shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] active:shadow-[1px_1px_0px_0px_rgba(0,0,0,1)] cursor-pointer ${connectionStatus[platform.id]
+                              ? 'bg-emerald-500 text-white shadow-none cursor-default active:translate-x-0 active:translate-y-0'
+                              : connecting === platform.id
+                                ? 'bg-zinc-100 text-zinc-400 border-zinc-300 shadow-none cursor-not-allowed'
+                                : 'bg-zinc-900 text-white hover:bg-zinc-800'
+                              }`}
                           >
                             {connectionStatus[platform.id] ? (
                               <>
@@ -565,7 +576,7 @@ export default function SettingsPage() {
                               </>
                             )}
                           </button>
-                          
+
                           {connectionStatus[platform.id] && (
                             <button
                               onClick={() => handleDisconnect(platform.id)}
@@ -630,9 +641,8 @@ export default function SettingsPage() {
                 </div>
 
                 {status && (
-                  <div className={`mb-6 p-4 rounded-2xl flex items-center space-x-3 border-2 ${
-                    status.type === 'success' ? 'bg-emerald-50 border-emerald-950 text-emerald-900' : 'bg-red-50 border-red-950 text-red-900'
-                  }`}>
+                  <div className={`mb-6 p-4 rounded-2xl flex items-center space-x-3 border-2 ${status.type === 'success' ? 'bg-emerald-50 border-emerald-950 text-emerald-900' : 'bg-red-50 border-red-950 text-red-900'
+                    }`}>
                     {status.type === 'success' ? <CheckCircle className="w-5 h-5 text-emerald-600" /> : <AlertCircle className="w-5 h-5 text-red-600" />}
                     <p className="font-bold text-sm">{status.message}</p>
                   </div>
@@ -811,7 +821,7 @@ export default function SettingsPage() {
                             )}
                           </div>
                         ))}
-                        
+
                         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-3 border-t border-zinc-200">
                           <div className="flex items-center space-x-2 flex-1 max-w-xs">
                             <label className="text-xs font-black text-zinc-600 uppercase tracking-wider whitespace-nowrap">Total Experience (Years)</label>
@@ -956,9 +966,9 @@ export default function SettingsPage() {
                           <label className={labelClass}>
                             Expected Salary <span className="text-zinc-500 font-bold normal-case text-xs">{formatSalaryLPA(profile.expected_salary)}</span>
                           </label>
-                          <input 
-                            type="number" 
-                            placeholder="e.g., 400000" 
+                          <input
+                            type="number"
+                            placeholder="e.g., 400000"
                             min="0"
                             value={profile.expected_salary || ''}
                             onChange={e => {
@@ -966,8 +976,8 @@ export default function SettingsPage() {
                               if (val === '' || /^\d+$/.test(val)) {
                                 setProfile({ ...profile, expected_salary: val });
                               }
-                            }} 
-                            className={inputClass} 
+                            }}
+                            className={inputClass}
                           />
                           <p className="text-[10px] text-zinc-500 font-semibold mt-1">Required: Annual CTC in INR (digits only, e.g., 400000 for 4 Lakhs LPA)</p>
                         </div>
@@ -991,11 +1001,95 @@ export default function SettingsPage() {
                             <option value="no">No</option>
                           </select>
                         </div>
+                        <div>
+                          <label className={labelClass}>Requires Sponsorship?</label>
+                          <select value={profile.requires_sponsorship === undefined ? '' : profile.requires_sponsorship ? 'yes' : 'no'}
+                            onChange={e => setProfile({ ...profile, requires_sponsorship: e.target.value === '' ? undefined : e.target.value === 'yes' })}
+                            className={inputClass}>
+                            <option value="">Not specified</option>
+                            <option value="yes">Yes</option>
+                            <option value="no">No</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className={labelClass}>Country of Citizenship</label>
+                          <input type="text" placeholder="e.g., India" value={profile.country_of_citizenship || ''}
+                            onChange={e => setProfile({ ...profile, country_of_citizenship: e.target.value })} className={inputClass} />
+                        </div>
+                        <div className="md:col-span-2">
+                          <label className={labelClass}>Preferred Work Models</label>
+                          <input type="text" placeholder="Comma separated: Remote, Hybrid, On-site" value={(profile.preferred_work_models || []).join(', ')}
+                            onChange={e => setProfile({ ...profile, preferred_work_models: e.target.value.split(',').map(m => m.trim()).filter(Boolean) })}
+                            className={inputClass} />
+                        </div>
                         <div className="md:col-span-2">
                           <label className={labelClass}>Languages Spoken</label>
                           <input type="text" placeholder="Comma separated: English, Hindi, ..." value={(profile.languages || []).join(', ')}
                             onChange={e => setProfile({ ...profile, languages: e.target.value.split(',').map(l => l.trim()).filter(Boolean) })}
                             className={inputClass} />
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Demographics (EEO) */}
+                    <SectionHeader title="Demographics (EEO)" icon={Users} section="demographics" />
+                    {expandedSections.demographics && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-zinc-50 rounded-xl border-2 border-zinc-200 mt-2">
+                        <div>
+                          <label className={labelClass}>Gender</label>
+                          <select value={profile.gender || ''} onChange={e => setProfile({ ...profile, gender: e.target.value })} className={inputClass}>
+                            <option value="">Not specified</option>
+                            <option value="Male">Male</option>
+                            <option value="Female">Female</option>
+                            <option value="Non-binary">Non-binary</option>
+                            <option value="Decline">Decline to self-identify</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className={labelClass}>Disability Status</label>
+                          <select value={profile.disability_status || ''} onChange={e => setProfile({ ...profile, disability_status: e.target.value })} className={inputClass}>
+                            <option value="">Not specified</option>
+                            <option value="Yes">Yes, I have a disability</option>
+                            <option value="No">No, I don't have a disability</option>
+                            <option value="Decline">Decline to self-identify</option>
+                          </select>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Detailed Address */}
+                    <SectionHeader title="Detailed Address" icon={MapPin} section="address" />
+                    {expandedSections.address && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-zinc-50 rounded-xl border-2 border-zinc-200 mt-2">
+                        <div className="md:col-span-2">
+                          <label className={labelClass}>Address Line 1</label>
+                          <input type="text" placeholder="e.g. 123 Main St" value={profile.address_line_1 || ''}
+                            onChange={e => setProfile({ ...profile, address_line_1: e.target.value })} className={inputClass} />
+                        </div>
+                        <div className="md:col-span-2">
+                          <label className={labelClass}>Address Line 2 (Optional)</label>
+                          <input type="text" placeholder="e.g. Apt 4B" value={profile.address_line_2 || ''}
+                            onChange={e => setProfile({ ...profile, address_line_2: e.target.value })} className={inputClass} />
+                        </div>
+                        <div>
+                          <label className={labelClass}>City</label>
+                          <input type="text" placeholder="e.g. Mumbai" value={profile.city || ''}
+                            onChange={e => setProfile({ ...profile, city: e.target.value })} className={inputClass} />
+                        </div>
+                        <div>
+                          <label className={labelClass}>State / Province</label>
+                          <input type="text" placeholder="e.g. Maharashtra" value={profile.state_province || ''}
+                            onChange={e => setProfile({ ...profile, state_province: e.target.value })} className={inputClass} />
+                        </div>
+                        <div>
+                          <label className={labelClass}>Postal Code</label>
+                          <input type="text" placeholder="e.g. 400001" value={profile.postal_code || ''}
+                            onChange={e => setProfile({ ...profile, postal_code: e.target.value })} className={inputClass} />
+                        </div>
+                        <div>
+                          <label className={labelClass}>Country</label>
+                          <input type="text" placeholder="e.g. India" value={profile.country || ''}
+                            onChange={e => setProfile({ ...profile, country: e.target.value })} className={inputClass} />
                         </div>
                       </div>
                     )}

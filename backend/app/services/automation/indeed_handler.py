@@ -1,4 +1,5 @@
 import logging
+import re
 from urllib.parse import urlparse
 from typing import Optional
 from playwright.async_api import Page
@@ -20,7 +21,10 @@ class IndeedHandler(BasePlatformHandler):
         try:
             modal = await self.service._get_active_modal(target)
             curr_target = modal if modal else target
-            container_text = (await curr_target.inner_text()).lower()
+            if hasattr(curr_target, "goto"):
+                container_text = (await curr_target.locator("body").inner_text()).lower()
+            else:
+                container_text = (await curr_target.inner_text()).lower()
 
             success_signals = [
                 "application sent",
@@ -74,6 +78,10 @@ class IndeedHandler(BasePlatformHandler):
                 "input[type='tel']",
                 "input[name*='firstName']",
                 "input[name*='first_name']",
+                "input[name*='first-name']",
+                "input[data-testid*='first-name']",
+                "input[name*='last-name']",
+                "input[data-testid*='last-name']",
             ]:
                 try:
                     if await curr_target.locator(sel).count() > 0:
@@ -106,32 +114,29 @@ class IndeedHandler(BasePlatformHandler):
         modal_locator = await self.service._get_active_modal(target)
         curr_target = modal_locator if modal_locator else target
 
-        for sel in [
-            "button:has-text('Next')",
-            "button:has-text('Continue')",
-            "button:has-text('Review')",
-            "button[aria-label*='Continue to']",
-            "button[aria-label*='Next']",
-            "button#form-action-continue",
-            "button[class*='continue']",
-            "button[class*='next']",
-        ]:
-            try:
-                btn = curr_target.locator(sel).last
-                if await btn.is_visible(timeout=1500) and await btn.is_enabled():
-                    await btn.scroll_into_view_if_needed()
-                    await btn.click()
-                    logger.info(f"[Indeed Nav] Clicked navigation button: {sel}")
-                    await self.service._wait_for_page_settle(target)
-                    return True
-            except Exception:
-                continue
+        clicked = await self._click_first_visible(
+            curr_target,
+            [
+                "button:has-text('Next')",
+                "button:has-text('Continue')",
+                "button:has-text('Review')",
+                "button[aria-label*='Continue to']",
+                "button[aria-label*='Next']",
+                "button#form-action-continue",
+                "button[class*='continue']",
+                "button[class*='next']",
+            ],
+            timeout_ms=1500
+        )
+        if clicked:
+            logger.info("[Indeed Nav] Clicked navigation button successfully.")
+            await self.service._wait_for_page_settle(target)
+            return True
         return False
 
     async def handle_review_step(self, target, modal_locator, db, job) -> bool:
         curr_target = modal_locator if modal_locator else target
 
-        submit_btn = None
         submit_selectors = [
             "button:has-text('Submit application')",
             "button[aria-label*='Submit application']",
@@ -141,14 +146,7 @@ class IndeedHandler(BasePlatformHandler):
             "button#form-action-send",
             "button[data-testid='submit-application-button']",
         ]
-        for s_sel in submit_selectors:
-            try:
-                btn = curr_target.locator(s_sel).last
-                if await btn.is_visible(timeout=2000):
-                    submit_btn = btn
-                    break
-            except Exception:
-                continue
+        submit_btn = await self._find_first_visible(curr_target, submit_selectors, timeout_ms=2000)
 
         if submit_btn:
             await submit_btn.click()
@@ -245,3 +243,94 @@ class IndeedHandler(BasePlatformHandler):
                 "url": page.url,
             }
         return None
+
+    async def fill_phone_country_code(self, target, profile: dict) -> bool:
+        """
+        Custom combobox interaction logic for selecting Indeed's phone country code.
+        """
+        phone_country_code = profile.get("phone_country_code", "").strip()
+        if not phone_country_code:
+            logger.info("[Indeed CountryCode] No phone_country_code in profile. Defaulting to +1.")
+            phone_country_code = "+1"
+
+        # Find the active modal/form container
+        modal_locator = await self.service._get_active_modal(target)
+        curr_target = modal_locator if modal_locator else target
+
+        # 1. Locate the combobox
+        combobox = curr_target.locator("div[role='combobox']").first
+        if await combobox.count() == 0:
+            logger.debug("[Indeed CountryCode] No combobox found in current step/target.")
+            return False
+
+        # Verify it is indeed the phone country select combobox (by label or parent text/aria attribute)
+        try:
+            combobox_text = (await combobox.inner_text()).strip()
+            # If the combobox already displays our target country code, skip clicking!
+            code_digits = re.sub(r"\D", "", phone_country_code)
+            curr_digits = re.sub(r"\D", "", combobox_text)
+            if curr_digits == code_digits:
+                logger.info(f"[Indeed CountryCode] Already selected code: {combobox_text} (matches target +{code_digits}). Skipping selection.")
+                return True
+        except Exception as e:
+            logger.debug(f"[Indeed CountryCode] Error checking current selected value: {e}")
+
+        # 2. Click the combobox to open the dropdown listbox
+        try:
+            logger.info("[Indeed CountryCode] Clicking combobox to show dropdown options...")
+            await combobox.click()
+            await target.wait_for_timeout(500)
+        except Exception as e:
+            logger.error(f"[Indeed CountryCode] Failed to click combobox: {e}")
+            return False
+
+        # 3. Locate the listbox and matching option
+        try:
+            # We want to match f"+{code_digits}" in the text of the options
+            target_str = f"+{code_digits}"
+            options = curr_target.locator("ul[role='listbox'] li[role='option'], [role='listbox'] [role='option']")
+            opt_count = await options.count()
+            logger.debug(f"[Indeed CountryCode] Found {opt_count} options in listbox. Searching for '{target_str}'...")
+
+            for i in range(opt_count):
+                opt = options.nth(i)
+                opt_text = await opt.inner_text()
+                if target_str in opt_text:
+                    logger.info(f"[Indeed CountryCode] Found matching option '{opt_text.strip()}' at index {i}. Clicking it.")
+                    await opt.scroll_into_view_if_needed()
+                    await opt.click()
+                    await target.wait_for_timeout(500)
+                    return True
+
+            # Fallback to click based on data-testid attribute if mapping exists
+            country_mapping = {
+                "1": "US",     # United States / Canada
+                "91": "IN",    # India
+                "44": "GB",    # United Kingdom
+                "61": "AU",    # Australia
+                "49": "DE",    # Germany
+                "33": "FR",    # France
+            }
+            iso_code = country_mapping.get(code_digits)
+            if iso_code:
+                fallback_opt = curr_target.locator(f"li[data-testid='country-select-{iso_code}']").first
+                if await fallback_opt.count() > 0:
+                    logger.info(f"[Indeed CountryCode] Found option via fallback data-testid='country-select-{iso_code}'. Clicking it.")
+                    await fallback_opt.scroll_into_view_if_needed()
+                    await fallback_opt.click()
+                    await target.wait_for_timeout(500)
+                    return True
+
+            logger.warning(f"[Indeed CountryCode] Could not find any option matching '{target_str}'.")
+            # Close the combobox by clicking it again
+            await combobox.click()
+        except Exception as e:
+            logger.error(f"[Indeed CountryCode] Error selecting country code option: {e}")
+            # Try to close combobox
+            try:
+                await combobox.click()
+            except Exception:
+                pass
+
+        return False
+

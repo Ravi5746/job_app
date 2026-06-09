@@ -274,8 +274,23 @@ class UserProfileUpdate(BaseModel):
     expected_salary: Optional[str] = None
     notice_period: Optional[str] = None
     work_authorization: Optional[str] = None
+    requires_sponsorship: Optional[bool] = None
+    country_of_citizenship: Optional[str] = None
     willing_to_relocate: Optional[bool] = None
+    preferred_work_models: Optional[List[str]] = None
     questionnaire: Optional[List[Dict[str, str]]] = None
+
+    # EEO / Demographic
+    gender: Optional[str] = None
+    disability_status: Optional[str] = None
+
+    # Detailed Address
+    address_line_1: Optional[str] = None
+    address_line_2: Optional[str] = None
+    city: Optional[str] = None
+    state_province: Optional[str] = None
+    postal_code: Optional[str] = None
+    country: Optional[str] = None
 
     @field_validator("expected_salary")
     @classmethod
@@ -329,8 +344,23 @@ def _build_profile_response(user) -> dict:
         "expected_salary": user.expected_salary or "",
         "notice_period": user.notice_period or "",
         "work_authorization": user.work_authorization or "",
+        "requires_sponsorship": user.requires_sponsorship,
+        "country_of_citizenship": user.country_of_citizenship or "",
         "willing_to_relocate": user.willing_to_relocate,
+        "preferred_work_models": user.preferred_work_models or [],
         "questionnaire": normalized_q,
+        
+        # EEO
+        "gender": user.gender or "",
+        "disability_status": user.disability_status or "",
+        
+        # Address
+        "address_line_1": user.address_line_1 or "",
+        "address_line_2": user.address_line_2 or "",
+        "city": user.city or "",
+        "state_province": user.state_province or "",
+        "postal_code": user.postal_code or "",
+        "country": user.country or "",
     }
 
     # Calculate profile completeness
@@ -398,8 +428,32 @@ async def update_my_profile(
         current_user.notice_period = profile_in.notice_period
     if profile_in.work_authorization is not None:
         current_user.work_authorization = profile_in.work_authorization
+    if profile_in.requires_sponsorship is not None:
+        current_user.requires_sponsorship = profile_in.requires_sponsorship
+    if profile_in.country_of_citizenship is not None:
+        current_user.country_of_citizenship = profile_in.country_of_citizenship
     if profile_in.willing_to_relocate is not None:
         current_user.willing_to_relocate = profile_in.willing_to_relocate
+    if profile_in.preferred_work_models is not None:
+        current_user.preferred_work_models = profile_in.preferred_work_models
+
+    if profile_in.gender is not None:
+        current_user.gender = profile_in.gender
+    if profile_in.disability_status is not None:
+        current_user.disability_status = profile_in.disability_status
+
+    if profile_in.address_line_1 is not None:
+        current_user.address_line_1 = profile_in.address_line_1
+    if profile_in.address_line_2 is not None:
+        current_user.address_line_2 = profile_in.address_line_2
+    if profile_in.city is not None:
+        current_user.city = profile_in.city
+    if profile_in.state_province is not None:
+        current_user.state_province = profile_in.state_province
+    if profile_in.postal_code is not None:
+        current_user.postal_code = profile_in.postal_code
+    if profile_in.country is not None:
+        current_user.country = profile_in.country
     
     if profile_in.questionnaire is not None:
         current_user.questionnaire = profile_in.questionnaire

@@ -25,7 +25,9 @@ import {
   Database,
   CheckCircle,
   Trash2,
-  Zap
+  Zap,
+  Bookmark,
+  BookmarkCheck
 } from 'lucide-react';
 
 interface Job {
@@ -79,6 +81,7 @@ function JobsContent() {
   const [selectedResumeId, setSelectedResumeId] = useState<number | null>(null);
   const searchParams = useSearchParams();
   const [activeCategory, setActiveCategory] = useState('All');
+  const [savedJobIds, setSavedJobIds] = useState<number[]>([]);
 
   useEffect(() => {
     const syncQuery = searchParams.get('sync');
@@ -100,7 +103,17 @@ function JobsContent() {
 
   useEffect(() => {
     fetchJobs();
+    fetchSavedJobs();
   }, [activeCategory, page, statusFilter]);
+
+  const fetchSavedJobs = async () => {
+    try {
+      const res = await api.get('/jobs/saved-jobs');
+      setSavedJobIds(res.data.map((j: Job) => j.id));
+    } catch (err) {
+      console.error("Failed to fetch saved jobs:", err);
+    }
+  };
 
   const fetchJobs = async () => {
     try {
@@ -164,7 +177,10 @@ function JobsContent() {
 
   const handleSync = async (targetCategory?: string) => {
     const query = targetCategory || searchTerm || activeCategory;
-    if (query === 'All') return;
+    if (!query || query === 'All') {
+      alert('Please enter a search query (e.g. "React Developer") in the search box first to sync fresh jobs from the web.');
+      return;
+    }
 
     try {
       setIsSyncing(true);
@@ -257,6 +273,22 @@ function JobsContent() {
     } catch (error) {
       console.error('Failed to update job status:', error);
       alert('Failed to update job status.');
+    }
+  };
+
+  const handleToggleSaveJob = async (jobId: number, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const isSaved = savedJobIds.includes(jobId);
+    try {
+      if (isSaved) {
+        await api.delete(`/jobs/${jobId}/save`);
+        setSavedJobIds(prev => prev.filter(id => id !== jobId));
+      } else {
+        await api.post(`/jobs/${jobId}/save`);
+        setSavedJobIds(prev => [...prev, jobId]);
+      }
+    } catch (error) {
+      console.error('Failed to toggle save job:', error);
     }
   };
 
@@ -552,6 +584,17 @@ function JobsContent() {
                   </div>
 
                   <div className="flex items-center space-x-3 shrink-0">
+                    <button
+                      onClick={(e) => handleToggleSaveJob(job.id, e)}
+                      className={`flex items-center justify-center p-3.5 rounded-xl border-2 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] active:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] transition-all cursor-pointer ${
+                        savedJobIds.includes(job.id) 
+                          ? 'bg-amber-100 border-amber-900 text-amber-700 hover:bg-amber-200' 
+                          : 'bg-white border-zinc-950 text-zinc-600 hover:bg-zinc-50'
+                      }`}
+                      title={savedJobIds.includes(job.id) ? "Unsave Job" : "Save Job"}
+                    >
+                      {savedJobIds.includes(job.id) ? <BookmarkCheck size={18} className="fill-amber-700" /> : <Bookmark size={18} />}
+                    </button>
                     <button
                       onClick={(e) => handleDeleteJob(job.id, e)}
                       className="flex items-center justify-center p-3.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 border-2 border-rose-950 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] active:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] transition-all cursor-pointer"

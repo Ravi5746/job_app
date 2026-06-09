@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     TINYFISH_API_KEY: str = ""
     OPENAI_MODEL: str = "openai/gpt-oss-20b"
+    OPENAI_MODEL_FALLBACK: str = "meta-llama/llama-3.1-8b-instruct:free"
 
     # ── LLM Provider ──
     LLM_PROVIDER: Literal["groq", "ollama", "openrouter"] = "groq"
@@ -56,11 +57,12 @@ class Settings(BaseSettings):
     MAX_FORM_STEPS:    int = 15
     MAX_FILL_RETRIES:  int = 2
     LLM_TIMEOUT_SECS:  float = 12.0
-    LLM_MAX_TOKENS:    int = 1000
+    LLM_MAX_TOKENS:    int = 4096
 
     # ── LangSmith Observability ──
     LANGCHAIN_TRACING_V2:  str = "false"
     LANGCHAIN_API_KEY:     str = ""
+    LANGCHAIN_ENDPOINT:    str = "https://api.smith.langchain.com"
     LANGCHAIN_PROJECT:     str = "job-applied-automation"
 
     HEADLESS: bool = False
@@ -76,3 +78,11 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Export LangSmith environment variables programmatically so LangChain's internal hooks pick them up
+import os
+if settings.LANGCHAIN_TRACING_V2.lower() == "true":
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_API_KEY"] = settings.LANGCHAIN_API_KEY
+    os.environ["LANGCHAIN_ENDPOINT"] = settings.LANGCHAIN_ENDPOINT
+    os.environ["LANGCHAIN_PROJECT"] = settings.LANGCHAIN_PROJECT

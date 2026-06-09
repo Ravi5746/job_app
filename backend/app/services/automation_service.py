@@ -1,10 +1,12 @@
 import tempfile
 import psutil
+import time
 
 from dotenv import load_dotenv
 import asyncio
 import sys
 import os
+
 import re
 import json
 import logging
@@ -16,7 +18,9 @@ from playwright.async_api import async_playwright, Page, FileChooser, Frame
 from sqlalchemy.orm import Session
 from app.models.job import Job as JobModel
 from app.models.resume import Resume as ResumeModel
+from app.models.application import Application as ApplicationModel, ApplicationStep as ApplicationStepModel
 from app.ai.hermes import hermes_agent
+
 from app.core.config import settings
 from app.core import security
 from app.ai import prompts
@@ -25,8 +29,8 @@ from app.services.automation.indeed_handler import IndeedHandler
 
 load_dotenv()
 
-# Fix for NotImplementedError when using Playwright on Windows
-if sys.platform == "win32":
+# Fix for NotImplementedError when using Playwright on Windows (only needed for Python < 3.8)
+if sys.platform == "win32" and sys.version_info < (3, 8):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except AttributeError:
@@ -38,6 +42,61 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════
+
+def _text_values_match(current: str, target: str) -> bool:
+    """
+    Compare current pre-filled text value from DOM against the target profile value.
+    Normalizes whitespaces, casing, and handles phone/country-code numeric variations.
+    """
+    c_clean = current.strip()
+    t_clean = target.strip()
+    
+    if c_clean.lower() == t_clean.lower():
+        return True
+        
+    # Check if they are phone numbers or country codes by checking digits
+    digits_c = re.sub(r'\D', '', c_clean)
+    digits_t = re.sub(r'\D', '', t_clean)
+    
+    if digits_c and digits_t:
+        # For short numeric codes (like country dial codes +91 vs 91)
+        if len(digits_c) < 5 and len(digits_t) < 5:
+            return digits_c == digits_t
+            
+        # For longer numeric strings (like full phone numbers)
+        if len(digits_c) >= 7 and len(digits_t) >= 7:
+            return digits_c.endswith(digits_t) or digits_t.endswith(digits_c)
+            
+    return False
+
+def _select_values_match(curr_val: str, curr_text: str, target: str) -> bool:
+    """
+    Compare current pre-filled select option against the target profile value.
+    Matches logic from fill_select for consistency.
+    """
+    c_val = curr_val.strip().lower()
+    c_txt = curr_text.strip().lower()
+    tgt = target.strip().lower()
+    
+    if c_val == tgt or c_txt == tgt:
+        return True
+        
+    # Partial match logic consistent with fill_select
+    if tgt in c_txt or (len(c_txt) >= 2 and c_txt in tgt):
+        return True
+        
+    # Also check if numeric parts of country codes match
+    digits_c_val = re.sub(r'\D', '', c_val)
+    digits_c_txt = re.sub(r'\D', '', c_txt)
+    digits_tgt = re.sub(r'\D', '', tgt)
+    
+    if digits_tgt:
+        if digits_c_val and digits_c_val == digits_tgt:
+            return True
+        if digits_c_txt and digits_c_txt == digits_tgt:
+            return True
+            
+    return False
 
 def _normalize_questionnaire(questionnaire_data: list) -> dict:
     """Normalize questionnaire data from user settings into a {question: answer} dict."""
@@ -88,10 +147,62 @@ class AutomationService:
         self._active_contexts = {}
 
     async def _get_playwright(self):
-        if not self._playwright:
-            from playwright.async_api import async_playwright
-            self._playwright = await async_playwright().start()
-            logger.info("[Browser] Persistent Playwright process started.")
+        """
+        Returns a healthy Playwright instance, creating or re-creating it as needed.
+
+        Root-cause of the 'NoneType' has no attribute 'send' crash:
+          Celery runs each task in a fresh asyncio event loop. If self._playwright
+          was started on a previous loop, its internal _connection._loop is dead.
+          Playwright does not raise on access to `pw.chromium` itself, but any RPC
+          call (like launch_persistent_context) fails with AttributeError because
+          the connection channel is None. Retrying on the same stale instance never
+          helps — we must detect, teardown, and restart.
+        """
+        if self._playwright is not None:
+            # Health-probe: verify the Playwright connection is still alive.
+            # The simplest signal is whether chromium._impl_obj._channel._connection
+            # is still a live object. We use a safe attribute walk.
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                # Check the playwright connection object's loop matches the running loop
+                conn = getattr(self._playwright, "_impl_obj", None)
+                if conn is None:
+                    raise RuntimeError("playwright._impl_obj is None — connection dead")
+                # Also verify chromium is accessible (not None)
+                if self._playwright.chromium is None:
+                    raise RuntimeError("playwright.chromium is None — connection dead")
+                # If the running loop is different from when playwright was started,
+                # the connection is on a dead loop — must restart.
+                pw_loop = getattr(
+                    getattr(conn, "_connection", None), "_loop", None
+                )
+                if pw_loop is not None and pw_loop != loop and not pw_loop.is_running():
+                    raise RuntimeError("Playwright loop is dead — must restart")
+                logger.debug("[Browser] Reusing existing Playwright instance.")
+                return self._playwright
+            except Exception as health_err:
+                logger.warning(
+                    f"[Browser] Stale Playwright instance detected ({health_err}). "
+                    "Tearing down and restarting..."
+                )
+                # Tear down all cached browser contexts tied to the dead connection
+                for ctx in list(self._active_contexts.values()):
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+                self._active_contexts.clear()
+                # Stop the old playwright instance (best-effort)
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+
+        from playwright.async_api import async_playwright
+        self._playwright = await async_playwright().start()
+        logger.info("[Browser] Fresh Playwright process started.")
         return self._playwright
 
     async def _get_or_create_context(self, user_id: int, platform_name: str):
@@ -160,7 +271,7 @@ class AutomationService:
                                 if 'ms-playwright' in exe_path:
                                     logger.info(f"[Browser] Killing orphaned browser process: {proc.info['name']} (PID: {proc.info['pid']})")
                                     proc.kill()
-                        except (psutil.NoSuchProcess, proc.AccessDenied):
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
                 except Exception as kill_err:
                     logger.warning(f"[Browser] Could not kill orphaned chrome processes: {kill_err}")
@@ -294,7 +405,10 @@ class AutomationService:
                         return
 
             # Fallback text check: if modal text indicates a resume is selected
-            modal_text = (await curr_target.inner_text()).lower()
+            if hasattr(curr_target, "goto"):
+                modal_text = (await curr_target.locator("body").inner_text()).lower()
+            else:
+                modal_text = (await curr_target.inner_text()).lower()
             if "selected" in modal_text and any(ext in modal_text for ext in [".pdf", ".docx", ".doc"]):
                 logger.info("[ResumeUpload] Resume appears pre-selected in modal. Skipping upload.")
                 return
@@ -377,20 +491,65 @@ class AutomationService:
         # ── Inner fill helpers ─────────────────────────────────────────────
 
         async def fill_text(el) -> bool:
-            """React-compatible text fill: clear, fill and dispatch events."""
+            """React-compatible text fill: clear, fill and dispatch events.
+            Falls back to keyboard typing for contenteditable/rich-text areas."""
             try:
                 await el.scroll_into_view_if_needed()
                 await el.click(timeout=1500)
                 await target.wait_for_timeout(80)
-                await el.press("Control+a")
-                await el.press("Delete")
-                await el.fill(answer)
-                await el.evaluate(
-                    "el => { "
-                    "el.dispatchEvent(new Event('input', { bubbles: true })); "
-                    "el.dispatchEvent(new Event('change', { bubbles: true })); "
-                    "}"
+
+                # Detect if element is contenteditable (e.g. LinkedIn Description field)
+                is_contenteditable = await el.evaluate(
+                    "el => el.isContentEditable || el.getAttribute('contenteditable') === 'true'"
                 )
+
+                if is_contenteditable:
+                    # Use keyboard approach for contenteditable rich-text editors
+                    await el.press("Control+a")
+                    await el.press("Delete")
+                    await el.type(answer, delay=20)
+                    await el.evaluate(
+                        "el => { "
+                        "el.dispatchEvent(new Event('input', { bubbles: true })); "
+                        "el.dispatchEvent(new Event('change', { bubbles: true })); "
+                        "}"
+                    )
+                else:
+                    await el.press("Control+a")
+                    await el.press("Delete")
+                    await target.wait_for_timeout(50)
+                    await el.type(answer, delay=15)
+                    await el.evaluate(
+                        "el => { "
+                        "el.dispatchEvent(new Event('input', { bubbles: true })); "
+                        "el.dispatchEvent(new Event('change', { bubbles: true })); "
+                        "}"
+                    )
+
+                # Handle potential autocomplete dropdowns (e.g. City/Location fields)
+                await target.wait_for_timeout(500)
+                try:
+                    dropdown_sel = ".artdeco-typeahead__results, .search-basic-typeahead, [role='listbox']"
+                    dropdown = target.locator(dropdown_sel).first
+                    if await dropdown.is_visible(timeout=1000):
+                        import logging
+                        logging.getLogger(__name__).info(f"[Fill] Autocomplete dropdown detected. Selecting first option.")
+                        await el.press("ArrowDown")
+                        await target.wait_for_timeout(200)
+                        await el.press("Enter")
+                        await target.wait_for_timeout(300)
+
+                        # Fallback pointer click if dropdown remains open
+                        if await dropdown.is_visible(timeout=200):
+                            first_item_sel = ".artdeco-typeahead__results li, [role='option'], .search-basic-typeahead__item"
+                            first_item = dropdown.locator(first_item_sel).first
+                            if await first_item.is_visible(timeout=500):
+                                logging.getLogger(__name__).info(f"[Fill] Keyboard navigation failed or list still open. Clicking first dropdown item.")
+                                await first_item.click(force=True)
+                                await target.wait_for_timeout(300)
+                except Exception as exc:
+                    pass
+
                 await target.wait_for_timeout(100)
                 logger.debug(f"[Fill] Text field '{label or qa_idx}' filled with '{answer}'")
                 return True
@@ -399,29 +558,101 @@ class AutomationService:
                 return False
 
         async def fill_select(el) -> bool:
-            """Select option: exact label → exact value → partial text match."""
+            """Select option: exact label → exact value → partial text match → first available valid fallback option."""
+            async def select_and_dispatch(select_fn):
+                await select_fn()
+                await el.evaluate("el => { el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }")
+                await target.wait_for_timeout(100)
+                return True
+
             for fn in [
-                lambda: el.select_option(label=answer, timeout=1500),
-                lambda: el.select_option(value=answer, timeout=1500),
+                lambda: select_and_dispatch(lambda: el.select_option(label=answer, timeout=1500, force=True)),
+                lambda: select_and_dispatch(lambda: el.select_option(value=answer, timeout=1500, force=True)),
             ]:
                 try:
-                    await fn()
-                    await target.wait_for_timeout(100)
-                    return True
+                    if await fn():
+                        logger.info(f"[Fill] Select '{label or qa_idx}' successfully filled with '{answer}' (exact match)")
+                        return True
                 except Exception:
                     pass
-            # Partial match fallback
+            # Partial match fallback (bidirectional)
+            opts = []
             try:
                 opts = await el.evaluate(
                     "el => Array.from(el.options).map(o => ({v: o.value, t: o.text.trim()}))"
                 )
                 for opt in opts:
-                    if answer.lower() in opt["t"].lower():
-                        await el.select_option(value=opt["v"])
-                        await target.wait_for_timeout(100)
-                        return True
+                    opt_text_lower = opt["t"].lower()
+                    if opt_text_lower:
+                        if answer.lower() in opt_text_lower:
+                            await select_and_dispatch(lambda: el.select_option(value=opt["v"], timeout=1500, force=True))
+                            logger.info(f"[Fill] Select '{label or qa_idx}' successfully filled with '{opt['t']}' (partial text match)")
+                            return True
+                        elif len(opt_text_lower) >= 2 and opt_text_lower in answer.lower():
+                            await select_and_dispatch(lambda: el.select_option(value=opt["v"], timeout=1500, force=True))
+                            logger.info(f"[Fill] Select '{label or qa_idx}' successfully filled with '{opt['t']}' (bidirectional partial match)")
+                            return True
+                            
+                    # Country code fallback (if answer contains +XX)
+                    import re
+                    m = re.search(r'\+(\d+)', answer)
+                    if m:
+                        target_code = m.group(1)
+                        matching_opts = []
+                        for opt in opts:
+                            if opt["v"].strip() in (target_code, f"+{target_code}") or f"+{target_code}" in opt["t"]:
+                                matching_opts.append(opt)
+                                
+                        if matching_opts:
+                            best_opt = matching_opts[0]
+                            answer_words = set(re.findall(r'[a-zA-Z]+', answer.lower()))
+                            
+                            # Fallbacks for naked codes
+                            if not answer_words:
+                                if target_code == "1": answer_words = {"united", "states"}
+                                elif target_code == "44": answer_words = {"united", "kingdom"}
+                                elif target_code == "61": answer_words = {"australia"}
+                                
+                            for opt in matching_opts:
+                                opt_words = set(re.findall(r'[a-zA-Z]+', opt["t"].lower()))
+                                if answer_words.intersection(opt_words):
+                                    best_opt = opt
+                                    break
+                                    
+                            await select_and_dispatch(lambda: el.select_option(value=best_opt["v"], timeout=1500, force=True))
+                            logger.info(f"[Fill] Select '{label or qa_idx}' successfully filled with '{best_opt['t']}' (country code match)")
+                            return True
             except Exception as exc:
                 logger.debug(f"[Fill] fill_select partial error: {exc}")
+            
+            # --- Fallback to first available option ---
+            try:
+                if opts:
+                    # Filter options to find valid (non-placeholder) ones
+                    valid_opts = []
+                    for opt in opts:
+                        val = opt["v"].strip()
+                        txt = opt["t"].strip().lower()
+                        # Exclude standard empty options or placeholder patterns
+                        if val and not any(p in txt for p in ["select", "choose", "placeholder", "--"]):
+                            valid_opts.append(opt)
+                    
+                    if valid_opts:
+                        fallback_opt = valid_opts[0]
+                        await select_and_dispatch(lambda: el.select_option(value=fallback_opt["v"], timeout=1500, force=True))
+                        logger.info(f"[Fill] Select '{label or qa_idx}' fallback to first valid option: '{fallback_opt['t']}'")
+                        return True
+                    
+                    # Absolute fallback: select the first option with any value
+                    for opt in opts:
+                        if opt["v"].strip():
+                            await select_and_dispatch(lambda: el.select_option(value=opt["v"], timeout=1500, force=True))
+                            logger.info(f"[Fill] Select '{label or qa_idx}' absolute fallback to first non-empty option: '{opt['t']}'")
+                            return True
+            except Exception as fallback_exc:
+                logger.debug(f"[Fill] fill_select fallback option selection failed: {fallback_exc}")
+
+            logger.warning(f"[Fill] Select '{label or qa_idx}' failed to match answer '{answer}' and could not fallback to any options")
             return False
 
         async def fill_radio(el) -> bool:
@@ -562,15 +793,58 @@ class AutomationService:
             )
             return False
 
-        is_text = ftype in ("text", "number", "textarea")
-        if is_text:
-            return await fill_text(el)
-        elif ftype == "select":
+        # ── Pre-fill Validation Check ──────────────────────────────────────
+        
+        try:
+            if ftype == "select":
+                selected_info = await el.evaluate(
+                    "el => { "
+                    "const opt = el.options[el.selectedIndex]; "
+                    "return opt ? { value: opt.value, text: opt.textContent.trim() } : null; "
+                    "}"
+                )
+                if selected_info:
+                    curr_val = selected_info["value"]
+                    curr_text = selected_info["text"]
+                    if _select_values_match(curr_val, curr_text, answer):
+                        logger.info(f"[Fill] Select '{label or qa_idx}' already matches target '{answer}'. Skipping.")
+                        return True
+            elif ftype == "checkbox":
+                is_checked = await el.is_checked()
+                target_state = answer.lower() in ("yes", "true", "checked", "1", "on")
+                if is_checked == target_state:
+                    logger.info(f"[Fill] Checkbox '{label or qa_idx}' already matches target state ({target_state}). Skipping.")
+                    return True
+            elif ftype == "radio":
+                is_checked = await el.is_checked()
+                if is_checked:
+                    # If this specific radio element is already checked, it's correct.
+                    logger.info(f"[Fill] Radio '{label or qa_idx}' is already checked. Skipping.")
+                    return True
+            else:
+                is_contenteditable = await el.evaluate(
+                    "el => el.isContentEditable || el.getAttribute('contenteditable') === 'true'"
+                )
+                if is_contenteditable:
+                    curr_val = await el.inner_text()
+                else:
+                    curr_val = await el.input_value()
+                    
+                if _text_values_match(curr_val, answer):
+                    logger.info(f"[Fill] Text field '{label or qa_idx}' already matches target '{answer}'. Skipping.")
+                    return True
+        except Exception as e:
+            logger.debug(f"[Fill] Pre-fill validation check failed: {e}")
+
+        if ftype == "select":
             return await fill_select(el)
         elif ftype == "checkbox":
             return await fill_checkbox(el)
-        else:
+        elif ftype == "radio":
             return await fill_radio(el)
+        else:
+            # Fallback to text fill for all other input types (e.g. text, tel, email, number, url, input, textarea)
+            return await fill_text(el)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Navigation helper
@@ -597,7 +871,46 @@ class AutomationService:
         if job.status == "applied":
             return {"status": "error", "message": "Already applied: job is already marked 'applied'."}
 
+        # Create/retrieve Application record to track metrics and status
+        resume = db.query(ResumeModel).filter(ResumeModel.user_id == user_id).order_by(ResumeModel.created_at.desc()).first()
+        resume_id = resume.id if resume else None
+
+        application = db.query(ApplicationModel).filter(
+            ApplicationModel.user_id == user_id,
+            ApplicationModel.job_id == job_id
+        ).first()
+
+        if not application:
+            application = ApplicationModel(
+                user_id=user_id,
+                job_id=job_id,
+                resume_id=resume_id,
+                status="applying"
+            )
+            db.add(application)
+            db.commit()
+            db.refresh(application)
+        else:
+            application.status = "applying"
+            application.resume_id = resume_id
+            application.notes = None
+            db.commit()
+            db.refresh(application)
+
+        # Validate job platform URL (Automation only supports LinkedIn and Indeed)
+        url_lower = (job.url or "").lower()
+        if "linkedin.com" not in url_lower and "indeed.com" not in url_lower:
+            application.status = "failed"
+            application.notes = "Unsupported platform: automation is only supported for LinkedIn and Indeed."
+            db.commit()
+            await report_progress("ERROR", "Automation only supports LinkedIn and Indeed platforms.")
+            return {
+                "status": "error",
+                "message": "Automation only supports LinkedIn and Indeed platforms."
+            }
+
         await report_progress("STARTED", f"Initializing application for {job.title} at {job.company}")
+
 
         resume = (
             db.query(ResumeModel)
@@ -621,7 +934,7 @@ class AutomationService:
                 "email":                  user.email or "",
                 "phone":                  user.phone or "",
                 "phone_country_code":     user.phone_country_code or "",
-                "location":               user.location or "",
+                "location":               ", ".join([p.strip() for p in [getattr(user, "city", ""), getattr(user, "state_province", ""), getattr(user, "country", "")] if p and p.strip()]) or (user.location or ""),
                 "linkedin_url":           user.linkedin_url or "",
                 "github_url":             user.github_url or "",
                 "portfolio_url":          user.portfolio_url or "",
@@ -638,6 +951,17 @@ class AutomationService:
                 "willing_to_relocate":    user.willing_to_relocate,
                 "desired_job_titles":     user.desired_job_titles or [],
                 "questionnaire_answers":  _normalize_questionnaire(user.questionnaire),
+                "gender":                 getattr(user, "gender", ""),
+                "disability_status":      getattr(user, "disability_status", ""),
+                "requires_sponsorship":   getattr(user, "requires_sponsorship", False),
+                "country_of_citizenship": getattr(user, "country_of_citizenship", ""),
+                "preferred_work_models":  getattr(user, "preferred_work_models", []),
+                "address_line_1":         getattr(user, "address_line_1", ""),
+                "address_line_2":         getattr(user, "address_line_2", ""),
+                "city":                   getattr(user, "city", ""),
+                "state_province":         getattr(user, "state_province", ""),
+                "postal_code":            getattr(user, "postal_code", ""),
+                "country":                getattr(user, "country", ""),
             }
             logger.info(
                 f"Loaded enriched profile for: {profile_data.get('full_name', 'User')} "
@@ -679,6 +1003,7 @@ class AutomationService:
         platform_name = "indeed" if is_indeed else "linkedin"
         context = None
         page = None
+        keep_page_open = False
         try:
             await report_progress("LAUNCHING_BROWSER", f"Launching browser context for {platform_name.upper()}...")
             context = await self._get_or_create_context(user_id, platform_name)
@@ -737,6 +1062,9 @@ class AutomationService:
             # Guard: Cloudflare or login wall
             page_content = await page.content()
             if "Request Blocked" in page_content or "Cloudflare" in page_content:
+                application.status = "failed"
+                application.notes = "Blocked by Cloudflare. Log in manually first."
+                db.commit()
                 return {"status": "error", "message": "Blocked by Cloudflare. Log in manually first."}
             
             # Wait for Cloudflare/Turnstile challenges to be solved (up to 50 seconds in headed browser)
@@ -752,6 +1080,9 @@ class AutomationService:
             # Check if session has expired
             if await handler.is_session_expired(page):
                 platform_name_cap = "Indeed" if is_indeed else "LinkedIn"
+                application.status = "failed"
+                application.notes = f"{platform_name_cap} session expired. Reconnect in Settings."
+                db.commit()
                 return {"status": "error", "message": f"{platform_name_cap} session expired. Reconnect in Settings."}
 
             # ── Locate Easy Apply button ──────────────────────────────────
@@ -759,6 +1090,9 @@ class AutomationService:
             apply_button = await handler.find_apply_button(page)
 
             if not apply_button:
+                application.status = "failed"
+                application.notes = "Easy Apply button not found after exhaustive search."
+                db.commit()
                 return {
                     "status": "error",
                     "message": "Easy Apply button not found after exhaustive search.",
@@ -772,6 +1106,9 @@ class AutomationService:
                 except Exception:
                     pass
                 if "company site" in btn_text or "employer" in btn_text:
+                    application.status = "failed"
+                    application.notes = "External application (Company website) detected."
+                    db.commit()
                     return {
                         "status": "warning",
                         "message": "External application (Company website) detected. Complete manually.",
@@ -807,6 +1144,7 @@ class AutomationService:
             # ── Set resume path for ToolRegistry ──────────────────────────
             self._resume_path = resume_file_path
 
+
             # ── Instantiate agent components ──────────────────────────────
             from app.ai.agent_llm import create_llm
             from app.services.automation.agent.tool_registry import ToolRegistry
@@ -822,12 +1160,15 @@ class AutomationService:
                 resume_text=resume_text,
                 job_id=job_id,
                 user_id=user_id,
+                application_id=application.id,
             )
 
             try:
                 logger.info("[Apply] Launching LangGraph agent flow...")
                 result = await agent.run(page, db, handler, self)
                 logger.info(f"[Apply] LangGraph agent execution completed: {result}")
+                if result.get("status") != "success":
+                    raise Exception(result.get("message", "LangGraph execution failed without success status."))
             except Exception as lg_exc:
                 logger.exception(f"[Apply] LangGraph initialization or execution failed: {lg_exc}. Falling back to Classic Agent...")
                 await report_progress("FALLBACK", "LangGraph error. Executing fallback classical loop...")
@@ -842,7 +1183,9 @@ class AutomationService:
                     resume_text=resume_text,
                     job_id=job_id,
                     user_id=user_id,
+                    application_id=application.id,
                 )
+
                 
                 # ── Fallback Step loop ──
                 MAX_STEPS = settings.MAX_FORM_STEPS
@@ -859,7 +1202,7 @@ class AutomationService:
                         db.commit()
                         break
 
-                    result = await classic_agent.run_step(target, step_num)
+                    result = await classic_agent.run_step(target, step_num, db=db)
                     status = result.get("status")
 
                     if status == "success":
@@ -885,38 +1228,71 @@ class AutomationService:
             redirect_warning = await handler.is_external_redirect(page, original_domain)
             if redirect_warning:
                 await report_progress("REDIRECTED", "Redirected to external platform.")
+                application.status = "failed"
+                application.notes = "Redirected to external platform."
+                db.commit()
+                keep_page_open = True
                 return redirect_warning
 
             is_success = (job.status == "applied")
+            application.status = "applied" if is_success else "failed"
+            if not is_success:
+                application.notes = "Auto apply fail: Submit application button not clicked."
+                keep_page_open = True
+            db.commit()
 
             os.makedirs(settings.SCREENSHOTS_DIR, exist_ok=True)
             screenshot_path = os.path.join(settings.SCREENSHOTS_DIR, f"job_{job_id}_applied.png")
-            await page.screenshot(path=screenshot_path, full_page=True)
-            await page.wait_for_timeout(5000)
+            if not os.path.exists(screenshot_path):
+                await page.screenshot(path=screenshot_path, full_page=True)
+                await page.wait_for_timeout(5000)
 
             await report_progress(
-                "SUCCESS" if is_success else "PARTIAL",
-                "Application submitted successfully!" if is_success else "Application flow completed partially."
+                "SUCCESS" if is_success else "ERROR",
+                "Application submitted successfully!" if is_success else "Auto apply fail: Submit application button not clicked."
             )
 
             return {
-                "status": "success" if is_success else "partial",
+                "status": "success" if is_success else "error",
                 "message": (
                     "Application submitted and verified!"
                     if is_success
-                    else "Automation complete — verify result in browser."
+                    else "Auto apply fail: Submit application button not clicked."
                 ),
                 "screenshot": screenshot_path,
             }
 
         except Exception as exc:
             logger.exception(f"Automation Error: {exc}")
+            keep_page_open = True
+            
+            # Capture error screenshot
+            if page:
+                try:
+                    os.makedirs(os.path.join(settings.SCREENSHOTS_DIR, "error"), exist_ok=True)
+                    err_screenshot_path = os.path.join(
+                        settings.SCREENSHOTS_DIR, "error", f"error_job_{job_id}_{int(time.time())}.png"
+                    )
+                    await page.screenshot(path=err_screenshot_path, full_page=True)
+                    logger.info(f"Captured error screenshot at: {err_screenshot_path}")
+                except Exception as ss_exc:
+                    logger.warning(f"Failed to capture error screenshot: {ss_exc}")
+            
+            # Update Application database status
+            try:
+                application.status = "failed"
+                application.notes = f"Automation Error: {exc}"
+                db.commit()
+            except Exception as db_err:
+                logger.error(f"Failed to update application DB status: {db_err}")
+
             await report_progress("ERROR", f"Automation Error: {exc}")
             return {"status": "error", "message": f"Automation Error: {exc}"}
 
+
         finally:
             try:
-                if page:
+                if page and not keep_page_open:
                     await page.close()
             except Exception:
                 pass

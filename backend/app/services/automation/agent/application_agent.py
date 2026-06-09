@@ -2,12 +2,10 @@ import logging
 from typing import TypedDict, List, Dict, Literal, Optional, Any
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from app.core.config import settings
+from app.core.config import settings, BASE_DIR
 
 from app.services.automation.agent.langgraph_helpers import (
     active_targets,
-    run_browser_launch,
-    run_navigate,
     run_detect_step_type,
     run_contact_handler,
     run_resume_upload,
@@ -34,7 +32,6 @@ class ApplicationState(TypedDict):
     filled_fields: Dict[str, bool]
     pending_fields: List[Dict[str, Any]]
     retry_count: int
-    token_usage: int
     errors: List[str]
     screenshot_paths: List[str]
     status: Literal["running", "paused", "succeeded", "failed"]
@@ -45,6 +42,8 @@ def route_after_detect(state: ApplicationState) -> str:
     status = state.get("status")
     if status == "succeeded" or step_type == "success":
         return "success"
+    if status == "failed":
+        return "human_review"
     if step_type == "review":
         return "review"
     if step_type == "resume_upload":
@@ -67,71 +66,8 @@ def route_after_validation(state: ApplicationState) -> str:
 def route_after_review(state: ApplicationState) -> str:
     if state.get("status") == "succeeded":
         return "success"
-    return "human_review"
-
-# Construct state machine graph
-builder = StateGraph(ApplicationState)
-
-# Add node definitions
-builder.add_node("browser_launch", run_browser_launch)
-builder.add_node("navigate", run_navigate)
-builder.add_node("detect_step_type", run_detect_step_type)
-builder.add_node("contact_handler", run_contact_handler)
-builder.add_node("resume_upload", run_resume_upload)
-builder.add_node("screening_qa", run_screening_qa)
-builder.add_node("validate_fields", run_validate_fields)
-builder.add_node("retry_fill", run_retry_fill)
-builder.add_node("advance_form", run_advance_form)
-builder.add_node("review", run_review)
-builder.add_node("success", run_success)
-builder.add_node("human_review", run_human_review)
-
-# Define transitions
-builder.add_edge(START, "browser_launch")
-builder.add_edge("browser_launch", "navigate")
-builder.add_edge("navigate", "detect_step_type")
-
-builder.add_conditional_edges(
-    "detect_step_type",
-    route_after_detect,
-    {
-        "success": "success",
-        "review": "review",
-        "resume_upload": "resume_upload",
-        "contact_handler": "contact_handler",
-        "screening_qa": "screening_qa",
-        "human_review": "human_review"
-    }
-)
-
-builder.add_edge("contact_handler", "validate_fields")
-builder.add_edge("resume_upload", "validate_fields")
-builder.add_edge("screening_qa", "validate_fields")
-
-builder.add_conditional_edges(
-    "validate_fields",
-    route_after_validation,
-    {
-        "advance_form": "advance_form",
-        "human_review": "human_review",
-        "retry_fill": "retry_fill"
-    }
-)
-
-builder.add_edge("retry_fill", "validate_fields")
-builder.add_edge("advance_form", "detect_step_type")
-
-builder.add_conditional_edges(
-    "review",
-    route_after_review,
-    {
-        "success": "success",
-        "human_review": "human_review"
-    }
-)
-
-builder.add_edge("success", END)
-builder.add_edge("human_review", END)
+    # If review fails (e.g. required fields are still missing), route back to detect_step_type to re-evaluate the page
+    return "detect_step_type"
 
 
 class ApplicationAgent:
@@ -148,16 +84,22 @@ class ApplicationAgent:
         profile: dict,
         resume_text: str,
         job_id: int,
-        user_id: int
+        user_id: int,
+        application_id: Optional[int] = None
     ):
-        self.llm = llm
+        from app.ai.agent_tools import AGENT_TOOLS
+        # Bind tools to the LLM so it uses structured tool calling and wrap with retries
+        self.llm = llm.bind_tools(AGENT_TOOLS).with_retry(
+            stop_after_attempt=5,
+            wait_exponential_jitter=True
+        )
         self.dom = dom
         self.tools = tools
         self.profile = profile
         self.resume_text = resume_text
         self.job_id = job_id
         self.user_id = user_id
-        self.builder = builder
+        self.application_id = application_id
 
     async def run(self, page, db, handler, svc) -> dict:
         """
@@ -176,6 +118,7 @@ class ApplicationAgent:
             "llm": self.llm,
             "dom": self.dom,
             "handler": handler,
+            "application_id": self.application_id,
         }
 
         # Initialize base state
@@ -190,7 +133,6 @@ class ApplicationAgent:
             "filled_fields": {},
             "pending_fields": [],
             "retry_count": 0,
-            "token_usage": 0,
             "errors": [],
             "screenshot_paths": [],
             "status": "running"
@@ -199,9 +141,72 @@ class ApplicationAgent:
         config = {"configurable": {"thread_id": thread_id}}
 
         try:
-            # Setup persistent SQLite checkpointer saver asynchronously
-            async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
-                graph = self.builder.compile(checkpointer=checkpointer)
+            # Construct state machine graph dynamically to avoid shared mutable state across threads
+            builder = StateGraph(ApplicationState)
+
+            # Add node definitions
+            builder.add_node("detect_step_type", run_detect_step_type)
+            builder.add_node("contact_handler", run_contact_handler)
+            builder.add_node("resume_upload", run_resume_upload)
+            builder.add_node("screening_qa", run_screening_qa)
+            builder.add_node("validate_fields", run_validate_fields)
+            builder.add_node("retry_fill", run_retry_fill)
+            builder.add_node("advance_form", run_advance_form)
+            builder.add_node("review", run_review)
+            builder.add_node("success", run_success)
+            builder.add_node("human_review", run_human_review)
+
+            # Define transitions
+            builder.add_edge(START, "detect_step_type")
+
+            builder.add_conditional_edges(
+                "detect_step_type",
+                route_after_detect,
+                {
+                    "success": "success",
+                    "review": "review",
+                    "resume_upload": "resume_upload",
+                    "contact_handler": "contact_handler",
+                    "screening_qa": "screening_qa",
+                    "human_review": "human_review"
+                }
+            )
+
+            builder.add_edge("contact_handler", "validate_fields")
+            builder.add_edge("resume_upload", "validate_fields")
+            builder.add_edge("screening_qa", "validate_fields")
+
+            builder.add_conditional_edges(
+                "validate_fields",
+                route_after_validation,
+                {
+                    "advance_form": "advance_form",
+                    "human_review": "human_review",
+                    "retry_fill": "retry_fill"
+                }
+            )
+
+            builder.add_edge("retry_fill", "validate_fields")
+            builder.add_edge("advance_form", "detect_step_type")
+
+            builder.add_conditional_edges(
+                "review",
+                route_after_review,
+                {
+                    "success": "success",
+                    "detect_step_type": "detect_step_type",
+                    "human_review": "human_review"
+                }
+            )
+
+            builder.add_edge("success", END)
+            builder.add_edge("human_review", END)
+
+            # Setup persistent SQLite checkpointer saver asynchronously using absolute path
+            import os
+            checkpoint_db_path = os.path.join(str(BASE_DIR), "checkpoints.db")
+            async with AsyncSqliteSaver.from_conn_string(checkpoint_db_path) as checkpointer:
+                graph = builder.compile(checkpointer=checkpointer)
                 
                 # Execute the state machine workflow
                 final_state = await graph.ainvoke(initial_state, config=config)

@@ -12,6 +12,39 @@ class BasePlatformHandler:
         """
         self.service = automation_service
 
+    async def _find_first_visible(self, curr_target, selectors: list[str], timeout_ms: int = 1000):
+        """
+        Iterate through the given selectors, and find the first matching element that is visible and enabled.
+        """
+        for sel in selectors:
+            try:
+                locators = curr_target.locator(sel)
+                count = await locators.count()
+                for i in range(count):
+                    btn = locators.nth(i)
+                    if await btn.is_visible(timeout=timeout_ms) and await btn.is_enabled():
+                        return btn
+            except Exception as e:
+                logger.debug(f"Error checking visibility for selector '{sel}': {e}")
+                continue
+        return None
+
+    async def _click_first_visible(self, curr_target, selectors: list[str], timeout_ms: int = 1000) -> bool:
+        """
+        Locate the first visible and enabled element among selectors, and click it.
+        """
+        btn = await self._find_first_visible(curr_target, selectors, timeout_ms)
+        if btn:
+            try:
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                logger.info(f"Clicked visible element matching selectors")
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to click matched element: {e}")
+        return False
+
+
     async def get_active_target(self, page: Page) -> tuple:
         """
         Determine the active target context (Page or Frame) and modal locator.

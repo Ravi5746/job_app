@@ -28,14 +28,29 @@ class User(Base):
     education = Column(JSON, nullable=True)              # [{degree, institution, year, field}, ...]
     certifications = Column(JSON, nullable=True)         # [{name, issuer, year}, ...]
 
+    # Demographic / EEO
+    gender = Column(String, nullable=True)               # "Male", "Female", "Non-binary", "Decline"
+    disability_status = Column(String, nullable=True)    # "Yes", "No", "Decline"
+
     # Job preferences (user-editable + auto-populated from questionnaire)
     desired_job_titles = Column(JSON, nullable=True)     # ["Full Stack Developer", "Backend Engineer"]
     expected_salary = Column(String, nullable=True)      # "12-15 LPA" or "80000"
     notice_period = Column(String, nullable=True)        # "30 days", "Immediate"
     work_authorization = Column(String, nullable=True)   # "Authorized to work"
+    requires_sponsorship = Column(Boolean, nullable=True)
+    country_of_citizenship = Column(String, nullable=True)
     willing_to_relocate = Column(Boolean, nullable=True)
     languages = Column(JSON, nullable=True)              # ["English", "Hindi"]
     portfolio_url = Column(String, nullable=True)
+    preferred_work_models = Column(JSON, nullable=True)  # ["Remote", "Hybrid", "On-site"]
+
+    # Detailed Address
+    address_line_1 = Column(String, nullable=True)
+    address_line_2 = Column(String, nullable=True)
+    city = Column(String, nullable=True)
+    state_province = Column(String, nullable=True)
+    postal_code = Column(String, nullable=True)
+    country = Column(String, nullable=True)
 
     questionnaire = Column(JSON, default=lambda: [
         "What is your current location?",

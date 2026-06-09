@@ -3,8 +3,8 @@ import sys
 import uvicorn
 
 if __name__ == "__main__":
-    # Fix for NotImplementedError on Windows
-    if sys.platform == 'win32':
+    # Fix for NotImplementedError on Windows (only needed for Python < 3.8)
+    if sys.platform == 'win32' and sys.version_info < (3, 8):
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     
     # Run the server

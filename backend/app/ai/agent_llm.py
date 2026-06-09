@@ -2,7 +2,6 @@ import logging
 from langchain_core.language_models import BaseChatModel
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from app.core.config import settings
-from langchain_ollama import ChatOllama
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +76,7 @@ def create_llm(tier: str = "smart") -> BaseChatModel | FallbackChatModel:
             )
 
     elif settings.LLM_PROVIDER == "ollama":
+        from langchain_ollama import ChatOllama
 
         logger.info(f"[LLM] Using Ollama — model: {settings.OLLAMA_MODEL}")
         return ChatOllama(
@@ -88,17 +88,75 @@ def create_llm(tier: str = "smart") -> BaseChatModel | FallbackChatModel:
     elif settings.LLM_PROVIDER == "openrouter":
         from langchain_openai import ChatOpenAI
 
-        logger.info(f"[LLM] Using OpenRouter — model: {settings.OPENAI_MODEL}")
-        # Note: OpenRouter uses OPENAI_API_KEY in this config
-        return ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=settings.OPENAI_API_KEY,
-            model=settings.OPENAI_MODEL,
-            temperature=0,
-            max_tokens=settings.LLM_MAX_TOKENS,
-        )
+        if tier == "smart":
+            logger.info(
+                f"[LLM] Creating OpenRouter smart model with fallback: "
+                f"primary={settings.OPENAI_MODEL}, fallback={settings.OPENAI_MODEL_FALLBACK}"
+            )
+            primary = ChatOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=settings.OPENAI_API_KEY,
+                model=settings.OPENAI_MODEL,
+                temperature=0,
+                max_tokens=settings.LLM_MAX_TOKENS,
+            )
+            fallback = ChatOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=settings.OPENAI_API_KEY,
+                model=settings.OPENAI_MODEL_FALLBACK,
+                temperature=0,
+                max_tokens=settings.LLM_MAX_TOKENS,
+            )
+            return FallbackChatModel(primary, fallback)
+        else:
+            logger.info(f"[LLM] Using OpenRouter — model: {settings.OPENAI_MODEL}, tier: {tier}")
+            # Note: OpenRouter uses OPENAI_API_KEY in this config
+            return ChatOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=settings.OPENAI_API_KEY,
+                model=settings.OPENAI_MODEL,
+                temperature=0,
+                max_tokens=settings.LLM_MAX_TOKENS,
+            )
 
     raise ValueError(
         f"Unknown LLM_PROVIDER: {settings.LLM_PROVIDER!r}. "
         f"Valid options: 'groq', 'ollama', 'openrouter'"
     )
+
+
+def calculate_llm_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
+    """
+    Calculate estimated cost of LLM call based on model name and tokens.
+    Pricing is per 1,000 tokens.
+    """
+    if not model_name:
+        return 0.0
+    
+    m_clean = model_name.lower()
+    
+    # Groq pricing
+    if "70b" in m_clean:
+        input_rate = 0.00059 / 1000.0
+        output_rate = 0.00079 / 1000.0
+    elif "8b" in m_clean:
+        input_rate = 0.00005 / 1000.0
+        output_rate = 0.00008 / 1000.0
+    # OpenAI general/default pricing
+    elif "gpt-4" in m_clean:
+        input_rate = 0.005 / 1000.0
+        output_rate = 0.015 / 1000.0
+    elif "gpt-3.5" in m_clean or "gpt-oss" in m_clean:
+        input_rate = 0.0015 / 1000.0
+        output_rate = 0.002 / 1000.0
+    # Ollama / local is free
+    elif "ollama" in m_clean or "local" in m_clean or "llama3" in m_clean:
+        input_rate = 0.0
+        output_rate = 0.0
+    else:
+        # Default fallback pricing
+        input_rate = 0.00015 / 1000.0
+        output_rate = 0.00015 / 1000.0
+        
+    return (input_tokens * input_rate) + (output_tokens * output_rate)
+

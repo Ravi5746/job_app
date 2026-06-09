@@ -70,8 +70,11 @@ class DOMLayer:
 
         modal_locator = await self.get_active_modal(target)
         if not modal_locator:
-            logger.warning("[Scraper] No active modal found — cannot extract HTML.")
-            return ""
+            logger.warning("[Scraper] No active modal found — falling back to target body.")
+            if hasattr(target, "locator"):
+                modal_locator = target.locator("body")
+            else:
+                return ""
 
         # Gather profile keywords for select option filtering
         profile_keywords = []
@@ -124,12 +127,26 @@ class DOMLayer:
                     const originalSelects = Array.from(modal.querySelectorAll("select"));
                     const selectedValues = originalSelects.map(sel => sel.value);
 
+                    const originalInputs = Array.from(modal.querySelectorAll("input, textarea"));
+                    const inputValues = originalInputs.map(el => el.type === 'checkbox' || el.type === 'radio' ? el.checked : el.value);
+
                     // Minify SELECT elements with many options (e.g. phone prefix select)
                     const selects = Array.from(clone.querySelectorAll("select"));
+                    
+                    const clonedInputs = Array.from(clone.querySelectorAll("input, textarea"));
+                    clonedInputs.forEach((el, i) => {
+                        if (el.type === 'checkbox' || el.type === 'radio') {
+                            if (inputValues[i]) el.setAttribute('checked', 'checked');
+                            else el.removeAttribute('checked');
+                        } else {
+                            if (inputValues[i]) el.setAttribute('value', inputValues[i]);
+                        }
+                    });
+
                     selects.forEach((select, selectIdx) => {
                         const originalValue = (selectedValues[selectIdx] || '').toLowerCase();
                         const options = Array.from(select.querySelectorAll("option"));
-                        if (options.length > 15) {
+                        if (options.length > 20) {
                             const keptOptions = [];
                             options.forEach(opt => {
                                 const text = opt.textContent.toLowerCase();
@@ -149,9 +166,9 @@ class DOMLayer:
                                 }
                             });
                             
-                            // If we kept nothing, or very few, add the first 5 options as fallback
-                            if (keptOptions.length < 5) {
-                                for (let i = 0; i < Math.min(5, options.length); i++) {
+                            // If we kept nothing, or very few, add the first 3 options as fallback
+                            if (keptOptions.length < 3) {
+                                for (let i = 0; i < Math.min(3, options.length); i++) {
                                     if (!keptOptions.includes(options[i])) {
                                         keptOptions.push(options[i]);
                                     }
@@ -164,7 +181,7 @@ class DOMLayer:
                         }
                     });
 
-                    const toUnwrap = Array.from(clone.querySelectorAll("div, span, strong, b, a, em, i, u, small, font, ul, ol, li"));
+                    const toUnwrap = Array.from(clone.querySelectorAll("div, span, strong, b, a, em, i, u, small, font, ul, ol, li, section, main, header, footer, aside, article, nav, details"));
                     for (let i = toUnwrap.length - 1; i >= 0; i--) {
                         const node = toUnwrap[i];
                         if (node.parentNode && !node.hasAttribute('data-qa-idx')) {
@@ -183,7 +200,8 @@ class DOMLayer:
                     const attrsToKeep = new Set([
                         "id", "name", "type", "value", "placeholder",
                         "checked", "selected", "required", "aria-label",
-                        "aria-labelledby", "for", "data-qa-idx"
+                        "aria-labelledby", "for", "data-qa-idx",
+                        "disabled", "readonly", "aria-disabled", "aria-readonly"
                     ]);
 
                     function cleanNode(node) {
@@ -191,10 +209,13 @@ class DOMLayer:
 
                         if (node.nodeType !== Node.ELEMENT_NODE) {
                             if (node.nodeType === Node.TEXT_NODE) {
-                                const text = node.nodeValue.trim();
+                                let text = node.nodeValue.trim();
                                 if (!text) {
                                     node.parentNode && node.parentNode.removeChild(node);
                                 } else {
+                                    if (text.length > 150) {
+                                        text = text.substring(0, 150) + "...";
+                                    }
                                     node.nodeValue = text;
                                 }
                             }
@@ -304,7 +325,10 @@ class DOMLayer:
                     pass
 
             # Fallback container check but scoped specifically to modal text elements
-            modal_text = (await curr_target.inner_text()).lower()
+            if hasattr(curr_target, "goto"):
+                modal_text = (await curr_target.locator("body").inner_text()).lower()
+            else:
+                modal_text = (await curr_target.inner_text()).lower()
             success_lines = [
                 "application sent",
                 "application was sent",
@@ -327,16 +351,51 @@ class DOMLayer:
         curr_target = modal if modal else target
         
         try:
-            return await curr_target.evaluate("""() => {
-                const required = document.querySelectorAll('[required], [aria-required="true"]');
+            return await curr_target.evaluate("""(node) => {
+                const root = node || document;
+                const required = root.querySelectorAll('[required], [aria-required="true"]');
                 const empty = [];
+                const checkedRadioGroups = new Set();
+                
                 for (const el of required) {
-                    const v = (el.value || '').trim();
-                    if (!v) {
-                        empty.push(el.getAttribute('aria-label')
-                                  || el.getAttribute('name')
-                                  || el.getAttribute('data-qa-idx')
-                                  || 'unknown');
+                    const type = (el.getAttribute('type') || '').toLowerCase();
+                    const name = el.getAttribute('name');
+                    
+                    if (type === 'radio') {
+                        if (name) {
+                            if (checkedRadioGroups.has(name)) continue;
+                            checkedRadioGroups.add(name);
+                            const group = root.querySelectorAll(`input[type="radio"][name="${name}"]`);
+                            const anyChecked = Array.from(group).some(r => r.checked);
+                            if (!anyChecked) {
+                                empty.push(el.getAttribute('aria-label')
+                                          || name
+                                          || el.getAttribute('data-qa-idx')
+                                          || 'unknown');
+                            }
+                        } else {
+                            if (!el.checked) {
+                                empty.push(el.getAttribute('aria-label')
+                                          || el.getAttribute('data-qa-idx')
+                                          || 'unknown');
+                            }
+                        }
+                    } else if (type === 'checkbox') {
+                        if (!el.checked) {
+                            empty.push(el.getAttribute('aria-label')
+                                      || el.getAttribute('name')
+                                      || el.getAttribute('data-qa-idx')
+                                      || 'unknown');
+                        }
+                    } else {
+                        const v = (el.value || '').trim();
+                        const vLower = v.toLowerCase();
+                        if (!v || vLower === 'select an option' || vLower === 'select' || vLower === 'select_one' || vLower === '--') {
+                            empty.push(el.getAttribute('aria-label')
+                                      || el.getAttribute('name')
+                                      || el.getAttribute('data-qa-idx')
+                                      || 'unknown');
+                        }
                     }
                 }
                 return empty;
@@ -354,14 +413,23 @@ class DOMLayer:
         soup = BeautifulSoup(html, "html.parser")
         fields = []
         for el in soup.find_all(attrs={"data-qa-idx": True}):
+            field_id = el.get("id", "")
+            label_text = ""
+            if field_id:
+                label_el = soup.find("label", attrs={"for": field_id})
+                if label_el:
+                    label_text = label_el.get_text(strip=True)
+                    
             fields.append({
                 "qa_idx":      el.get("data-qa-idx", ""),
                 "type":        el.get("type", el.name),
                 "aria-label":  el.get("aria-label", ""),
                 "placeholder": el.get("placeholder", ""),
                 "name":        el.get("name", ""),
-                "id":          el.get("id", ""),
+                "id":          field_id,
                 "value":       el.get("value", ""),
                 "required":    el.has_attr("required"),
+                "checked":     el.has_attr("checked"),
+                "label":       label_text,
             })
         return fields

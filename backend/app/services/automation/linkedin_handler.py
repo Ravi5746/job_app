@@ -29,7 +29,10 @@ class LinkedInHandler(BasePlatformHandler):
         try:
             modal = await self.service._get_active_modal(target)
             curr_target = modal if modal else target
-            container_text = (await curr_target.inner_text()).lower()
+            if hasattr(curr_target, "goto"):
+                container_text = (await curr_target.locator("body").inner_text()).lower()
+            else:
+                container_text = (await curr_target.inner_text()).lower()
 
             success_signals = [
                 "application sent",
@@ -41,6 +44,7 @@ class LinkedInHandler(BasePlatformHandler):
                 return "success"
 
             # Submit button → review page
+            has_review = False
             submit_selectors = [
                 "button:has-text('Submit application')",
                 "button[aria-label*='Submit application']",
@@ -49,11 +53,15 @@ class LinkedInHandler(BasePlatformHandler):
             for s_sel in submit_selectors:
                 try:
                     if await curr_target.locator(s_sel).count() > 0:
-                        return "review"
+                        has_review = True
+                        break
                 except Exception:
                     pass
+            if has_review:
+                return "review"
 
             # Resume upload — only when the upload UI card / button is visible
+            has_resume_upload = False
             for sel in [
                 ".jobs-document-upload-redesign-card__container",
                 "button:has-text('Upload resume')",
@@ -62,11 +70,13 @@ class LinkedInHandler(BasePlatformHandler):
             ]:
                 try:
                     if await curr_target.locator(sel).count() > 0:
-                        return "resume_upload"
+                        has_resume_upload = True
+                        break
                 except Exception:
                     pass
 
             # Contact info
+            has_contact_info = False
             for sel in [
                 "input[id*='phoneNumber']",
                 "input[name*='phoneNumber']",
@@ -75,11 +85,13 @@ class LinkedInHandler(BasePlatformHandler):
             ]:
                 try:
                     if await curr_target.locator(sel).count() > 0:
-                        return "contact_info"
+                        has_contact_info = True
+                        break
                 except Exception:
                     pass
 
             # Additional questions (text inputs, selects, radios, textareas)
+            has_questions = False
             for sel in [
                 "fieldset",
                 ".jobs-easy-apply-form-section__grouping",
@@ -92,9 +104,17 @@ class LinkedInHandler(BasePlatformHandler):
             ]:
                 try:
                     if await curr_target.locator(sel).count() > 0:
-                        return "questions"
+                        has_questions = True
+                        break
                 except Exception:
                     pass
+
+            if has_questions:
+                return "questions"
+            if has_resume_upload:
+                return "resume_upload"
+            if has_contact_info:
+                return "contact_info"
 
         except Exception as exc:
             logger.error(f"[LinkedIn StepDetector] Error: {exc}")
@@ -105,26 +125,24 @@ class LinkedInHandler(BasePlatformHandler):
         modal_locator = await self.service._get_active_modal(target)
         curr_target = modal_locator if modal_locator else target
 
-        for sel in [
-            "button:has-text('Next')",
-            "button:has-text('Continue')",
-            "button:has-text('Review')",
-            "button[aria-label*='Continue to']",
-            "button[aria-label*='Next']",
-            "button[data-easy-apply-next-button]",
-            "button[data-control-name='continue']",
-            "button[data-control-name='review']",
-        ]:
-            try:
-                btn = curr_target.locator(sel).last
-                if await btn.is_visible(timeout=1500) and await btn.is_enabled():
-                    await btn.scroll_into_view_if_needed()
-                    await btn.click()
-                    logger.info(f"[LinkedIn Nav] Clicked navigation button: {sel}")
-                    await self.service._wait_for_page_settle(target)
-                    return True
-            except Exception:
-                continue
+        clicked = await self._click_first_visible(
+            curr_target,
+            [
+                "button:has-text('Next')",
+                "button:has-text('Continue')",
+                "button:has-text('Review')",
+                "button[aria-label*='Continue to']",
+                "button[aria-label*='Next']",
+                "button[data-easy-apply-next-button]",
+                "button[data-control-name='continue']",
+                "button[data-control-name='review']",
+            ],
+            timeout_ms=1500
+        )
+        if clicked:
+            logger.info("[LinkedIn Nav] Clicked navigation button successfully.")
+            await self.service._wait_for_page_settle(target)
+            return True
         return False
 
     async def handle_review_step(self, target, modal_locator, db, job) -> bool:
@@ -138,44 +156,75 @@ class LinkedInHandler(BasePlatformHandler):
             ).first
             if await follow_cb.count() > 0 and await follow_cb.is_visible(timeout=1000):
                 if await follow_cb.is_checked():
-                    await follow_cb.click()
+                    await follow_cb.click(force=True)
                     await target.wait_for_timeout(200)
         except Exception:
             pass
 
-        submit_btn = None
-        for s_sel in [
+        # Wait for the page to fully settle before attempting Submit
+        # This prevents TargetClosedError when the modal closes unexpectedly
+        try:
+            await target.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+        await target.wait_for_timeout(1500)
+
+        submit_selectors = [
             "button:has-text('Submit application')",
             "button[aria-label*='Submit application']",
             "button:has-text('Submit')",
             "button[data-control-name='submit_unify']",
-        ]:
-            try:
-                btn = curr_target.locator(s_sel).last
-                if await btn.is_visible(timeout=2000):
-                    submit_btn = btn
-                    break
-            except Exception:
-                continue
+        ]
 
-        if submit_btn:
-            await submit_btn.click()
-            logger.info("[LinkedIn Review] Clicked Submit application. Waiting for confirmation...")
+        # Retry finding and clicking submit up to 3 times to handle transient modal state
+        for attempt in range(3):
+            submit_btn = await self._find_first_visible(curr_target, submit_selectors, timeout_ms=2000)
 
-            # Wait up to 6 seconds for success screen
-            for check in range(6):
-                await target.wait_for_timeout(1000)
-                next_step = await self.detect_easy_apply_step(target)
-                if next_step == "success":
-                    logger.info("[LinkedIn Review] Success screen detected!")
-                    break
+            if submit_btn:
+                try:
+                    await submit_btn.scroll_into_view_if_needed()
+                    await target.wait_for_timeout(300)
+                    await submit_btn.click(timeout=5000)
+                    logger.info(f"[LinkedIn Review] Clicked Submit application (attempt {attempt + 1}). Waiting for confirmation...")
 
-            job.status = "applied"
-            db.commit()
-            return True
-        else:
-            logger.warning("[LinkedIn Review] Submit application button not found or not visible.")
-            return False
+                    # Wait up to 8 seconds for success screen
+                    for check in range(8):
+                        await target.wait_for_timeout(1000)
+                        try:
+                            next_step = await self.detect_easy_apply_step(target)
+                            if next_step == "success":
+                                logger.info("[LinkedIn Review] Success screen detected!")
+                                job.status = "applied"
+                                db.commit()
+                                return True
+                        except Exception:
+                            pass
+
+                    # Even if success screen not detected, assume submitted if no error
+                    logger.info("[LinkedIn Review] Submit clicked — assuming success.")
+                    job.status = "applied"
+                    db.commit()
+                    return True
+
+                except Exception as click_err:
+                    logger.warning(f"[LinkedIn Review] Submit click attempt {attempt + 1} failed: {click_err}")
+                    if attempt < 2:
+                        await target.wait_for_timeout(2000)  # Wait before retry
+                        # Re-resolve curr_target in case modal context shifted
+                        try:
+                            _, new_modal = await self.get_active_target(
+                                target if hasattr(target, "goto") else target
+                            )
+                            curr_target = new_modal if new_modal else curr_target
+                        except Exception:
+                            pass
+                    continue
+            else:
+                logger.warning(f"[LinkedIn Review] Submit button not found on attempt {attempt + 1}.")
+                await target.wait_for_timeout(1500)
+
+        logger.warning("[LinkedIn Review] Submit application button not found or not clickable after 3 attempts.")
+        return False
 
     async def is_session_expired(self, page: Page) -> bool:
         return "linkedin.com/login" in page.url or "linkedin.com/authwall" in page.url
@@ -252,15 +301,14 @@ class LinkedInHandler(BasePlatformHandler):
         return None
 
     async def wait_for_apply_interface(self, page: Page) -> bool:
-        modal_selectors = [".artdeco-modal", "[role='dialog']", ".jobs-easy-apply-modal"]
-        for m_sel in modal_selectors:
-            try:
-                modal_el = page.locator(m_sel).first
-                await modal_el.wait_for(state="visible", timeout=8000)
-                logger.info(f"[LinkedIn Apply] Easy Apply modal detected: {m_sel}")
-                return True
-            except Exception:
-                continue
+        combined_selector = ".artdeco-modal, [role='dialog'], .jobs-easy-apply-modal"
+        try:
+            modal_el = page.locator(combined_selector).first
+            await modal_el.wait_for(state="visible", timeout=8000)
+            logger.info(f"[LinkedIn Apply] Easy Apply modal detected using: {combined_selector}")
+            return True
+        except Exception:
+            pass
         logger.warning("[LinkedIn Apply] No Easy Apply modal appeared after click. Proceeding blindly.")
         return False
 

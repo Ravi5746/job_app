@@ -14,7 +14,8 @@ from app.services.scraper_service import scraper_service
 from app.ai.hermes import hermes_agent
 from app.services.automation_service import automation_service
 from app.models.resume import Resume as ResumeModel
-from app.routes.auth import get_current_user
+from app.models.saved_job import SavedJob as SavedJobModel
+from app.routes.auth import get_current_user, get_current_active_superuser
 from app.models.user import User as UserModel
 from app.celery_app import apply_to_job_task, AsyncResult, _tasks
 from app.core.config import settings
@@ -60,7 +61,7 @@ async def enrich_job_data(
                         db_job.match_score = analysis.get("match_score")
                         db_job.match_suggestions = "\n".join(analysis.get("suggestions", []))
                     except Exception as enrich_err:
-                        print(f"Error in consolidated background enrichment for job {job_id}: {enrich_err}")
+                        logger.error(f"Error in consolidated background enrichment for job {job_id}: {enrich_err}")
                         db_job.skills = "Technical Skills"
                         db_job.requirements = reqs or "Check job description."
                 else:
@@ -75,18 +76,74 @@ async def enrich_job_data(
                 
                 db.commit()
     except Exception as e:
-        print(f"Error in background enrichment for job {job_id}: {e}")
+        logger.error(f"Error in background enrichment for job {job_id}: {e}")
     finally:
         db.close()
-
+ 
 def cleanup_expired_jobs(db: Session):
     """Deletes jobs from the DB where expires_at is past current time."""
     try:
         db.query(JobModel).filter(JobModel.expires_at < datetime.now(timezone.utc)).delete()
         db.commit()
     except Exception as e:
-        print(f"Error cleaning up expired jobs: {e}")
+        logger.error(f"Error cleaning up expired jobs: {e}")
         db.rollback()
+
+
+@router.get("/saved-jobs", response_model=List[Job])
+def get_saved_jobs(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    saved_jobs = db.query(SavedJobModel).filter(SavedJobModel.user_id == current_user.id).all()
+    job_ids = [sj.job_id for sj in saved_jobs]
+    if not job_ids:
+        return []
+    
+    jobs = db.query(JobModel).filter(JobModel.id.in_(job_ids)).order_by(JobModel.created_at.desc()).all()
+    return jobs
+
+@router.post("/{job_id}/save")
+def save_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    existing_save = db.query(SavedJobModel).filter(
+        SavedJobModel.user_id == current_user.id,
+        SavedJobModel.job_id == job_id
+    ).first()
+    
+    if existing_save:
+        return {"status": "success", "message": "Job already saved"}
+        
+    saved_job = SavedJobModel(user_id=current_user.id, job_id=job_id)
+    db.add(saved_job)
+    db.commit()
+    return {"status": "success", "message": "Job saved successfully"}
+
+@router.delete("/{job_id}/save")
+def unsave_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    saved_job = db.query(SavedJobModel).filter(
+        SavedJobModel.user_id == current_user.id,
+        SavedJobModel.job_id == job_id
+    ).first()
+    
+    if not saved_job:
+        raise HTTPException(status_code=404, detail="Saved job not found")
+        
+    db.delete(saved_job)
+    db.commit()
+    return {"status": "success", "message": "Job removed from saved list"}
+
 
 @router.get("/db-search/", response_model=List[Job])
 def db_search_jobs(
@@ -149,7 +206,8 @@ def read_jobs(
 def update_job(
     job_id: int,
     job_in: JobUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
 ):
     db_job = db.query(JobModel).filter(JobModel.id == job_id).first()
     if not db_job:
@@ -165,7 +223,8 @@ def update_job(
 
 @router.delete("/clear-all")
 def clear_all_jobs(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_active_superuser)
 ):
     try:
         db.query(JobModel).delete()
@@ -178,7 +237,8 @@ def clear_all_jobs(
 @router.delete("/{job_id}")
 def delete_job(
     job_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_active_superuser)
 ):
     db_job = db.query(JobModel).filter(JobModel.id == job_id).first()
     if not db_job:
@@ -199,7 +259,7 @@ async def search_external_jobs(
     try:
         external_jobs = scraper_service.search_jobs(query, location)
     except Exception as e:
-        print(f"Scraper error: {e}")
+        logger.error(f"Scraper error: {e}")
         external_jobs = []
 
     mapped_jobs = []
@@ -223,7 +283,8 @@ async def search_external_jobs(
                 try:
                     expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
                 except Exception as e:
-                    print(f"Error parsing job expiration '{expires_at_str}': {e}")
+                    logger.error(f"Error parsing job expiration '{expires_at_str}': {e}")
+
 
             # Skip saving if already expired
             if expires_at and expires_at < datetime.now(timezone.utc):
@@ -281,58 +342,16 @@ async def search_external_jobs(
                         qualifications
                     )
         
-    if not mapped_jobs:
-        # Fallback: Attempt to scrape real LinkedIn jobs using Guest API
-        try:
-            print("FALLBACK: Scraping LinkedIn Guest Jobs...")
-            real_linkedin_jobs = scraper_service.search_linkedin_guest(query, location)
-            if real_linkedin_jobs:
-                for ext_job in real_linkedin_jobs:
-                    job_url = ext_job.get("job_apply_link", "")
-                    if not job_url or job_url in seen_urls:
-                        continue
-                    seen_urls.add(job_url)
-                    
-                    job_in = JobCreate(
-                        title=ext_job.get("job_title", "Unknown Title"),
-                        company=ext_job.get("employer_name", "Unknown Company"),
-                        location=ext_job.get("job_city", location),
-                        description=ext_job.get("job_description", ""),
-                        url=job_url,
-                        source=ext_job.get("job_publisher", "LinkedIn"),
-                        category=category_to_save,
-                        status="active",
-                        priority=1  # Real direct LinkedIn jobs are high priority!
-                    )
-                    
-                    existing_job = db.query(JobModel).filter(JobModel.url == job_url).first()
-                    
-                    # Calculate ATS score and suggestions
-                    resume = db.query(ResumeModel).filter(ResumeModel.user_id == current_user.id).order_by(ResumeModel.created_at.desc()).first()
-                    if resume:
-                        try:
-                            analysis = await hermes_agent.analyze_job(job_in.description, resume.content)
-                            job_in.match_score = analysis.get("match_score")
-                            job_in.match_suggestions = "\n".join(analysis.get("suggestions", []))
-                        except Exception as match_err:
-                            print(f"Error calculating match score: {match_err}")
-                    
-                    if not existing_job:
-                        db_job = job_service.create(db, obj_in=job_in)
-                        mapped_jobs.append(db_job)
-                    else:
-                        for field, value in job_in.model_dump().items():
-                            setattr(existing_job, field, value)
-                        db.commit()
-                        mapped_jobs.append(existing_job)
-        except Exception as fallback_err:
-            print(f"LinkedIn Guest search fallback failed: {fallback_err}")
-            
     return mapped_jobs
 
 
+
 @router.post("/", response_model=Job)
-def create_job(job_in: JobCreate, db: Session = Depends(get_db)):
+def create_job(
+    job_in: JobCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
     return job_service.create(db, obj_in=job_in)
 
 @router.get("/{job_id}", response_model=Job)
@@ -402,9 +421,10 @@ async def apply_to_job(
             job.match_score = analysis.get("match_score")
             db.commit()
 
-    print(f"DEBUG: Enqueuing automation for job {job_id}")
+    logger.info(f"DEBUG: Enqueuing automation for job {job_id}")
     task = apply_to_job_task.delay(job_id, current_user.id)
     return {"status": "queued", "task_id": task.id}
+
 
 
 @router.get("/apply/status/{task_id}")

@@ -18,11 +18,13 @@ from app.routes import (
 )
 from app.core.config import settings
 from app.middleware.error_handler import error_handler_middleware
+from app.middleware.trace_id import trace_id_middleware
 
 from app.db.session import engine, Base
 
+
 # Import models
-from app.models import user, job, resume, application
+from app.models import user, job, resume, application, saved_job
 
 
 # Create DB tables
@@ -50,6 +52,8 @@ app.add_middleware(
 
 # Error Middleware
 app.middleware("http")(error_handler_middleware)
+app.middleware("http")(trace_id_middleware)
+
 
 
 # Routes

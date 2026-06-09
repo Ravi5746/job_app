@@ -11,7 +11,8 @@ import {
   LogOut,
   Plus,
   Search,
-  Sparkles
+  Sparkles,
+  Bookmark
 } from 'lucide-react';
 
 export default function DashboardLayout({
@@ -32,6 +33,7 @@ export default function DashboardLayout({
   const navItems = [
     { label: 'Dashboard', icon: LayoutDashboard, href: '/dashboard' },
     { label: 'Jobs', icon: Briefcase, href: '/dashboard/jobs' },
+    { label: 'Saved Jobs', icon: Bookmark, href: '/dashboard/saved-jobs' },
     { label: 'Resumes', icon: FileText, href: '/dashboard/resumes' },
     { label: 'Optimizer', icon: Sparkles, href: '/dashboard/resumes/optimizer' },
     { label: 'Settings', icon: Settings, href: '/dashboard/settings' },

@@ -5,8 +5,10 @@ import logging
 import uuid
 import threading
 import time
+from app.core.logger import trace_id_ctx
 
 # Setup logging
+
 logger = logging.getLogger(__name__)
 
 # Fix for Playwright on Windows inside background processes
@@ -59,18 +61,34 @@ class CustomTask:
         
         async def run_task():
             mock_self = MockSelf(task_id)
+            token = trace_id_ctx.set(task_id)
             try:
                 await self.func(mock_self, *args, **kwargs)
             except Exception as e:
                 logger.exception(f"Task {task_id} failed with exception: {e}")
                 mock_self.update_state("FAILED", {"message": str(e)})
+            finally:
+                trace_id_ctx.reset(token)
+
+        def run_in_thread():
+            if sys.platform == 'win32':
+                try:
+                    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+                except AttributeError:
+                    pass
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(run_task())
+            finally:
+                loop.close()
                 
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = asyncio.get_event_loop()
             
-        loop.create_task(run_task())
+        loop.run_in_executor(None, run_in_thread)
         
         class DelayResult:
             def __init__(self, id):

@@ -1,67 +1,51 @@
 import logging
 from datetime import datetime, timezone
-import numpy as np
+import difflib
 from sqlalchemy.orm import Session
 
 from app.models.qa_cache import QACache
-from app.services.automation.agent.semantic_classifier import semantic_classifier
 
 logger = logging.getLogger(__name__)
 
 class QACacheService:
-    def get_cached_answer(self, question_text: str, db: Session) -> tuple[str, str] | None:
+    def get_cached_answer(self, question_text: str, user_id: int, db: Session) -> tuple[str, str] | None:
         """
-        Retrieves a cached answer if a question with cosine similarity > 0.92 exists.
-        Falls back to exact string match if sentence-transformers is disabled.
+        Retrieves a cached answer if a question with difflib similarity > 0.92 exists for the user.
         """
         if not question_text or not question_text.strip():
             return None
 
         clean_question = question_text.strip()
 
-        # Fallback to exact match if SentenceTransformer model is disabled
-        if not semantic_classifier.enabled or not semantic_classifier.model:
-            logger.info(f"[QACache] Semantic search disabled. Performing exact match check for: '{clean_question}'")
-            entry = db.query(QACache).filter(QACache.question_text == clean_question).first()
-            if entry:
-                logger.info(f"[QACache] Exact match hit: '{clean_question}' -> '{entry.answer_text}'")
-                entry.used_count += 1
-                entry.last_used = datetime.now(timezone.utc)
-                db.commit()
-                return entry.answer_text, entry.reasoning or ""
-            return None
-
         try:
-            # Query all cached entries
-            cached_entries = db.query(QACache).all()
+            # Query all cached entries for the specific user
+            cached_entries = db.query(QACache).filter(QACache.user_id == user_id).all()
             if not cached_entries:
                 return None
 
-            # Generate input embedding
-            input_emb = semantic_classifier.model.encode([clean_question], convert_to_numpy=True)[0]
-            input_norm = np.linalg.norm(input_emb)
-            if input_norm > 1e-12:
-                input_emb = input_emb / input_norm
+            # First, check for an exact match (case-insensitive)
+            for entry in cached_entries:
+                if entry.question_text.lower() == clean_question.lower():
+                    logger.info(f"[QACache] Exact match hit: '{clean_question}' -> '{entry.answer_text}'")
+                    entry.used_count += 1
+                    entry.last_used = datetime.now(timezone.utc)
+                    db.commit()
+                    return entry.answer_text, entry.reasoning or ""
 
+            # If no exact match, use fuzzy matching via difflib
             best_entry = None
             best_score = -1.0
 
             for entry in cached_entries:
-                if not entry.question_embedding:
-                    continue
-                entry_emb = np.array(entry.question_embedding)
-                entry_norm = np.linalg.norm(entry_emb)
-                if entry_norm > 1e-12:
-                    entry_emb = entry_emb / entry_norm
-                    similarity = float(np.dot(input_emb, entry_emb))
-                    if similarity > best_score:
-                        best_score = similarity
-                        best_entry = entry
+                similarity = difflib.SequenceMatcher(None, clean_question.lower(), entry.question_text.lower()).ratio()
+                if similarity > best_score:
+                    best_score = similarity
+                    best_entry = entry
 
             if best_entry and best_score > 0.92:
                 logger.info(
                     f"[QACache] Cache HIT: '{clean_question}' matched with cached question "
-                    f"'{best_entry.question_text}' (similarity: {best_score:.4f})"
+                    f"'{best_entry.question_text}' (similarity: {best_score:.4f}, user={user_id})"
                 )
                 best_entry.used_count += 1
                 best_entry.last_used = datetime.now(timezone.utc)
@@ -78,10 +62,10 @@ class QACacheService:
 
         return None
 
-    def save_to_cache(self, question_text: str, answer_text: str, reasoning: str | None, db: Session) -> None:
+    def save_to_cache(self, question_text: str, answer_text: str, user_id: int, db: Session, reasoning: str | None = None) -> None:
         """
-        Saves a new question-answer pair and its embedding to the cache.
-        If the exact question text already exists, it updates the answer and reasoning.
+        Saves a new question-answer pair to the cache for the given user.
+        If the exact question text already exists for this user, it updates the answer and reasoning.
         """
         if not question_text or not question_text.strip() or not answer_text or not answer_text.strip():
             return
@@ -91,25 +75,20 @@ class QACacheService:
         clean_reasoning = reasoning.strip() if reasoning else None
 
         try:
-            # Generate embedding
-            embedding_list = []
-            if semantic_classifier.enabled and semantic_classifier.model:
-                input_emb = semantic_classifier.model.encode([clean_question], convert_to_numpy=True)[0]
-                embedding_list = input_emb.tolist()
-
-            # Check if exact match already exists
-            entry = db.query(QACache).filter(QACache.question_text == clean_question).first()
+            # Check if exact match already exists for this user
+            entry = db.query(QACache).filter(QACache.question_text == clean_question, QACache.user_id == user_id).first()
             if entry:
-                logger.info(f"[QACache] Updating existing exact match for: '{clean_question}'")
+                logger.info(f"[QACache] Updating existing exact match for: '{clean_question}' (user={user_id})")
                 entry.answer_text = clean_answer
                 entry.reasoning = clean_reasoning
-                entry.question_embedding = embedding_list
+                entry.question_embedding = [] # Store empty array instead of floats
                 entry.last_used = datetime.now(timezone.utc)
             else:
-                logger.info(f"[QACache] Saving new entry to cache: '{clean_question}' -> '{clean_answer}'")
+                logger.info(f"[QACache] Saving new entry to cache: '{clean_question}' -> '{clean_answer}' (user={user_id})")
                 new_entry = QACache(
+                    user_id=user_id,
                     question_text=clean_question,
-                    question_embedding=embedding_list,
+                    question_embedding=[], # Empty array
                     answer_text=clean_answer,
                     reasoning=clean_reasoning,
                     used_count=1,
