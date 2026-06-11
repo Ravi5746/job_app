@@ -25,9 +25,10 @@ I have successfully extracted all inline LLM prompts from the python source file
 *   **Path**: [app/ai/hermes.py](file:///d:/automation/Job%20Applied/backend/app/ai/hermes.py)
 *   **Refactoring**: Cleaned up the file by removing over 300 lines of inline prompt definitions, importing `app.ai.prompts` at the top, and calling the respective prompt generators before making API completions.
 
-### 4. Refactored Automation Service
-*   **Path**: [app/services/automation_service.py](file:///d:/automation/Job%20Applied/backend/app/services/automation_service.py)
-*   **Refactoring**: Refactored the single-pass HTML form-filler (`_get_single_pass_answers` method) to import the prompts module and fetch `system_msg` and `user_msg` templates dynamically.
+### 5. Fixed Contact Field Pre-fill (First Name / Last Name)
+*   **Path**: [app/services/automation/agent/langgraph_helpers.py](file:///d:/automation/Job%20Applied/backend/app/services/automation/agent/langgraph_helpers.py#L134)
+*   **Fix**: Modified the `is_contact_field` helper function to include `field.get("label", "")` in its evaluation list. Previously, it only checked `name`, `id`, `aria-label`, and `placeholder`.
+*   **Impact**: When a form element uses an associated `<label>` tag for its description (such as "First name") but has a dynamic or auto-generated `id`/`name`, the agent now correctly identifies it as a contact field. This prevents the agent from skipping the field if it was pre-filled with incorrect default values.
 
 ---
 
@@ -36,6 +37,8 @@ I have successfully extracted all inline LLM prompts from the python source file
 ### Automated Tests
 *   Executed syntax check commands to compile `app/ai/prompts.py`:
     `.\venv\Scripts\python.exe -c "import app.ai.prompts; print('Imports compiled successfully!')"`
+*   Executed syntax check commands to compile `app/services/automation/agent/langgraph_helpers.py`:
+    `python -c "import app.services.automation.agent.langgraph_helpers; print('Code compiled successfully!')"`
 *   Executed direct hermes extraction test script:
     `.\venv\Scripts\python.exe scratch\test_hermes_direct.py`
 *   Verified that imports compile correctly, settings initialize properly, database connections succeed, and the refactored prompts route correctly to the Groq/OpenRouter client.

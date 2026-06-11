@@ -3,6 +3,7 @@ import sys
 import re
 import logging
 import time
+import asyncio
 from typing import Dict, Any, List, Optional
 from langchain_core.runnables import RunnableConfig
 import json
@@ -136,6 +137,7 @@ def is_contact_field(field: dict) -> bool:
         field.get("id", ""),
         field.get("aria-label", ""),
         field.get("placeholder", ""),
+        field.get("label", ""),
     ]
     combined = " ".join([t for t in matchable_texts if t]).lower()
     from app.services.automation.agent.deterministic_fill import DETERMINISTIC_FIELD_MAP
@@ -227,9 +229,8 @@ async def run_detect_step_type(state: Dict[str, Any], config: RunnableConfig) ->
     # Detect step type
     step_type = await handler.detect_easy_apply_step(target)
     
-    # Clean and tag modal HTML
-    html = await dom.clean_and_tag(target, profile)
-    tagged_fields = await dom.extract_tagged_fields(html) if html else []
+    # Extract structured fields
+    structured_fields = await dom.extract_structured_schema(target, profile)
     
     # Check success screen
     if step_type == "success" or await dom.detect_success_element(target):
@@ -244,8 +245,8 @@ async def run_detect_step_type(state: Dict[str, Any], config: RunnableConfig) ->
     record_step_metrics(config, state.get("step_number", 0) + 1, f"detect_step_type_{step_type}", t0)
     return {
         "step_type": step_type,
-        "accessible_fields": tagged_fields,
-        "pending_fields": tagged_fields,
+        "accessible_fields": structured_fields,
+        "pending_fields": structured_fields,
         "step_number": state["step_number"] + 1,
         "retry_count": 0
     }
@@ -327,8 +328,8 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
     llm = ctx["llm"]
     db = ctx["db"]
     
-    # Fetch initial HTML to extract descriptive question labels
-    init_html = await dom.clean_and_tag(target, profile)
+    # Fetch initial structured schema to extract descriptive question labels
+    init_fields = await dom.extract_structured_schema(target, profile)
     
     # Layer 1 & 2: Pre-fill what we can
     filled = dict(state.get("filled_fields", {}))
@@ -350,7 +351,7 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
             continue
                         
         # Layer 2.5: Q&A Cache retrieval
-        question_text = extract_question_text(field, init_html)
+        question_text = field.get("label") or extract_question_text(field, "")
         if question_text and len(question_text) > 3:
             cached_res = qa_cache_service.get_cached_answer(question_text, state["user_id"], db)
             if cached_res:
@@ -381,9 +382,10 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
         )
         return {"filled_fields": filled, "pending_fields": []}
         
-    # Re-fetch HTML to reflect any filled fields if possible
-    html = await dom.clean_and_tag(target, profile)
-    if not html:
+    # Re-extract structured fields and generate minified schema string
+    current_fields = await dom.extract_structured_schema(target, profile)
+    schema_str = dom.to_minified_schema_string(current_fields)
+    if not schema_str:
         record_step_metrics(
             config,
             state.get("step_number", 0),
@@ -394,7 +396,7 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
         )
         return {"filled_fields": filled, "pending_fields": remaining_fields}
         
-    tagged_indices = dom.extract_tagged_indices(html)
+    tagged_indices = dom.extract_tagged_indices(schema_str)
 
     # ── Zero-field detection (Bug #3) ────────────────────────────────────────
     # If the scraper produced HTML with no interactive fields, calling the LLM
@@ -403,9 +405,8 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
     # can mark these fields as pending and trigger a retry or human review.
     if not tagged_indices:
         logger.warning(
-            "[ScreeningQA] SCRAPER ISSUE DETECTED: HTML contains zero data-qa-idx "
-            "elements. Skipping LLM call to prevent silent form advance. "
-            f"Step={state['step_number']}, html_len={len(html)}"
+            "[ScreeningQA] SCRAPER ISSUE DETECTED: Schema contains zero indices. "
+            f"Skipping LLM call. Step={state['step_number']}, schema_len={len(schema_str)}"
         )
         record_step_metrics(
             config,
@@ -414,7 +415,7 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
             t0,
             fields_attempted=len(pending_fields),
             fields_filled=0,
-            error_message="Zero data-qa-idx elements found — likely scraper failure"
+            error_message="Zero active fields found — likely scraper failure"
         )
         return {"filled_fields": filled, "pending_fields": remaining_fields}
     # ─────────────────────────────────────────────────────────────────────────
@@ -446,13 +447,26 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
         total_companies = len(work_exp)
         for job in work_exp:
             if isinstance(job, dict):
-                t = job.get("title") or job.get("role") or "Role"
+                t = job.get("title") or job.get("role") or job.get("job_title") or "Role"
                 comp = job.get("company") or "Company"
-                start = str(job.get("start_date") or job.get("start_year") or "")
-                end = str(job.get("end_date") or job.get("end_year") or "Present")
-                tenure = f"{start}-{end}" if start else "Unknown"
+                start = str(job.get("start") or job.get("start_date") or job.get("start_year") or "")
+                end = str(job.get("end") or job.get("end_date") or job.get("end_year") or "Present")
+                tenure = f"{start} to {end}" if start and end else (f"{start}-Present" if start else "Unknown")
+                summary = job.get("summary") or job.get("description") or ""
+                summary_clean = " ".join(summary.split())
                 
-                experience_breakdown.append(f"{comp} ({t}, {tenure})")
+                exp_str = f"{comp} ({t}, {tenure})"
+                if summary_clean:
+                    exp_str += f" - Summary: {summary_clean}"
+                raw_skills = job.get("skills")
+                skills_list = []
+                if isinstance(raw_skills, list):
+                    skills_list = [str(skill).strip() for skill in raw_skills if skill and str(skill).strip()]
+                elif isinstance(raw_skills, str):
+                    skills_list = [skill.strip() for skill in raw_skills.split(",") if skill.strip()]
+                if skills_list:
+                    exp_str += f" | Skills: {', '.join(skills_list)}"
+                experience_breakdown.append(exp_str)
                 
                 if t and t != "Role" and t not in experience_fields:
                     experience_fields.append(t)
@@ -461,14 +475,35 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
             first_job = work_exp[0]
             previous_company = first_job.get("company", "")
             previous_title = first_job.get("title") or first_job.get("role") or ""
-            start = first_job.get("start_date") or first_job.get("start_year")
-            end = first_job.get("end_date") or first_job.get("end_year")
+            start = first_job.get("start") or first_job.get("start_date") or first_job.get("start_year")
+            end = first_job.get("end") or first_job.get("end_date") or first_job.get("end_year")
             if start and end:
                 previous_company_tenure = f"{start} to {end}"
             elif start:
                 previous_company_tenure = f"Started {start}"
             elif end:
                 previous_company_tenure = f"Ended {end}"
+
+    # Context-aware profile slicing
+    needs_detailed_profile = False
+    for field in remaining_fields:
+        label = (field.get("label") or field.get("aria-label") or "").lower()
+        if field.get("type") in ("textarea", "text") and not is_contact_field(field):
+            if any(word in label for word in ["why", "describe", "explain", "project", "experience", "how", "tell", "responsibilit"]):
+                needs_detailed_profile = True
+                break
+
+    skills_list = profile.get("skills", [])
+    if not needs_detailed_profile and len(skills_list) > 10:
+        skills_str = ", ".join(skills_list[:10]) + " (and others)"
+    else:
+        skills_str = ", ".join(skills_list)
+        
+    summary_str = profile.get("summary", "")
+    if not needs_detailed_profile and len(summary_str) > 150:
+        summary_str = summary_str[:150] + "..."
+        
+    experience_breakdown_str = " | ".join(experience_breakdown)
 
     input_vars = {
         "full_name": profile.get("full_name", ""),
@@ -479,21 +514,25 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
         "total_years_experience": profile.get("total_years_experience", 0),
         "total_companies": total_companies,
         "experience_fields": ", ".join(experience_fields),
-        "experience_breakdown": " | ".join(experience_breakdown),
+        "experience_breakdown": experience_breakdown_str,
         "previous_title": previous_title,
         "previous_company": previous_company,
         "previous_company_tenure": previous_company_tenure,
         "expected_salary": expected_salary,
         "notice_period": profile.get("notice_period", ""),
         "work_authorization": work_auth,
+        "currently_working_status": (
+            "Currently working" if profile.get("currently_working_status") is True
+            else ("Not currently working" if profile.get("currently_working_status") is False else "Unknown")
+        ),
         "willing_to_relocate": "Yes" if profile.get("willing_to_relocate") else "No",
-        "skills": ", ".join(profile.get("skills", [])),
+        "skills": skills_str,
         "linkedin_url": profile.get("linkedin_url", ""),
         "github_url": profile.get("github_url", ""),
         "portfolio_url": profile.get("portfolio_url", ""),
         "education": str(profile.get("education", [])),
         "certifications": str(profile.get("certifications", [])),
-        "summary": profile.get("summary", ""),
+        "summary": summary_str,
         "qa_answers": qa_answers_str or "None available",
         "gender": profile.get("gender", ""),
         "disability_status": profile.get("disability_status", ""),
@@ -507,7 +546,7 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
         "postal_code": profile.get("postal_code", ""),
         "country": profile.get("country", ""),
         "step_num": state["step_number"],
-        "html": html,
+        "html": schema_str,
     }
     
     # Layer 3: LLM Fallback for truly novel fields
@@ -515,30 +554,43 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
     
     input_tokens = 0
     output_tokens = 0
-    try:
-        response = await llm.ainvoke(messages)
-        if hasattr(response, "response_metadata") and response.response_metadata:
-            token_usage = response.response_metadata.get("token_usage", {})
-            if token_usage:
-                input_tokens = token_usage.get("prompt_tokens", 0) or token_usage.get("input_tokens", 0) or 0
-                output_tokens = token_usage.get("completion_tokens", 0) or token_usage.get("output_tokens", 0) or 0
-        tool_calls = getattr(response, "tool_calls", [])
-    except Exception as llm_err:
-        logger.error(f"[ScreeningQA] LLM invocation failed: {llm_err}")
-        record_step_metrics(
-            config,
-            state.get("step_number", 0),
-            "screening_qa_failed_llm",
-            t0,
-            fields_attempted=len(pending_fields),
-            fields_filled=len(filled) - len(state.get("filled_fields", {})),
-            error_message=str(llm_err)
-        )
-        raise llm_err
+    max_retries = 3
+    base_delay = 2.0
+    response = None
+    
+    for attempt in range(max_retries):
+        try:
+            response = await llm.ainvoke(messages)
+            if hasattr(response, "response_metadata") and response.response_metadata:
+                token_usage = response.response_metadata.get("token_usage", {})
+                if token_usage:
+                    input_tokens = token_usage.get("prompt_tokens", 0) or token_usage.get("input_tokens", 0) or 0
+                    output_tokens = token_usage.get("completion_tokens", 0) or token_usage.get("output_tokens", 0) or 0
+            tool_calls = getattr(response, "tool_calls", [])
+            break
+        except Exception as llm_err:
+            err_msg = str(llm_err).lower()
+            is_transient = any(k in err_msg for k in ["429", "rate limit", "timeout", "503", "connection"])
+            if is_transient and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"[ScreeningQA] Transient LLM error: {llm_err}. Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"[ScreeningQA] LLM invocation failed: {llm_err}")
+                record_step_metrics(
+                    config,
+                    state.get("step_number", 0),
+                    "screening_qa_failed_llm",
+                    t0,
+                    fields_attempted=len(pending_fields),
+                    fields_filled=len(filled) - len(state.get("filled_fields", {})),
+                    error_message=str(llm_err)
+                )
+                raise llm_err
         
     # Store raw tool calls for potential retries
     ctx["last_tool_calls"] = tool_calls
-    ctx["last_html"] = html
+    ctx["last_html"] = schema_str
     
     valid_calls = HallucinationGuard.validate(tool_calls, tagged_indices)
     
@@ -554,7 +606,7 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
             # Save LLM-generated answer to Q&A Cache
             corresp_field = next((f for f in remaining_fields if f.get("qa_idx") == qa_idx), None)
             if corresp_field:
-                q_text = extract_question_text(corresp_field, html)
+                q_text = corresp_field.get("label") or extract_question_text(corresp_field, "")
                 a_text = serialize_tool_answer(tc)
                 if q_text and a_text:
                     qa_cache_service.save_to_cache(q_text, a_text, state["user_id"], db)
@@ -564,11 +616,11 @@ async def run_screening_qa(state: Dict[str, Any], config: RunnableConfig) -> Dic
     # Re-scan DOM to detect newly appeared (conditional) fields
     new_accessible_fields = list(state.get("accessible_fields", []))
     try:
-        new_html = await dom.clean_and_tag(target, profile)
-        if new_html:
-            scanned_fields = await dom.extract_tagged_fields(new_html)
+        new_fields = await dom.extract_structured_schema(target, profile)
+        new_schema_str = dom.to_minified_schema_string(new_fields)
+        if new_schema_str:
             existing_indices = {f.get("qa_idx") for f in new_accessible_fields}
-            for sf in scanned_fields:
+            for sf in new_fields:
                 sf_idx = sf.get("qa_idx")
                 if sf_idx and sf_idx not in existing_indices:
                     new_accessible_fields.append(sf)
@@ -627,16 +679,17 @@ async def run_retry_fill(state: Dict[str, Any], config: RunnableConfig) -> Dict[
     llm = ctx["llm"]
     db = ctx["db"]
     
-    html = await dom.clean_and_tag(target, state["profile"])
-    tagged_indices = dom.extract_tagged_indices(html)
+    current_fields = await dom.extract_structured_schema(target, state["profile"])
+    schema_str = dom.to_minified_schema_string(current_fields)
+    tagged_indices = {f["qa_idx"] for f in current_fields if f.get("qa_idx")}
     unfilled_labels = [f.get("aria-label") or f.get("name") or f.get("qa_idx") for f in state["pending_fields"]]
 
     # ── Zero-field detection in retry pass ─────────────────────────────────
     if not tagged_indices:
         logger.warning(
-            "[RetryFill] SCRAPER ISSUE DETECTED: HTML contains zero data-qa-idx "
-            "elements during retry pass. Skipping LLM call. "
-            f"Step={state['step_number']}, html_len={len(html)}"
+            "[RetryFill] SCRAPER ISSUE DETECTED: Schema contains zero indices "
+            "during retry pass. Skipping LLM call. "
+            f"Step={state['step_number']}, schema_len={len(schema_str)}"
         )
         record_step_metrics(
             config,
@@ -645,7 +698,7 @@ async def run_retry_fill(state: Dict[str, Any], config: RunnableConfig) -> Dict[
             t0,
             fields_attempted=len(state["pending_fields"]),
             fields_filled=0,
-            error_message="Zero data-qa-idx elements found in retry — likely scraper failure"
+            error_message="Zero indices found in retry — likely scraper failure"
         )
         return {"retry_count": state["retry_count"] + 1}
     # ───────────────────────────────────────────────────────────────
@@ -683,13 +736,26 @@ async def run_retry_fill(state: Dict[str, Any], config: RunnableConfig) -> Dict[
         total_companies = len(work_exp)
         for job in work_exp:
             if isinstance(job, dict):
-                t = job.get("title") or job.get("role") or "Role"
+                t = job.get("title") or job.get("role") or job.get("job_title") or "Role"
                 comp = job.get("company") or "Company"
-                start = str(job.get("start_date") or job.get("start_year") or "")
-                end = str(job.get("end_date") or job.get("end_year") or "Present")
-                tenure = f"{start}-{end}" if start else "Unknown"
+                start = str(job.get("start") or job.get("start_date") or job.get("start_year") or "")
+                end = str(job.get("end") or job.get("end_date") or job.get("end_year") or "Present")
+                tenure = f"{start} to {end}" if start and end else (f"{start}-Present" if start else "Unknown")
+                summary = job.get("summary") or job.get("description") or ""
+                summary_clean = " ".join(summary.split())
                 
-                experience_breakdown.append(f"{comp} ({t}, {tenure})")
+                exp_str = f"{comp} ({t}, {tenure})"
+                if summary_clean:
+                    exp_str += f" - Summary: {summary_clean}"
+                raw_skills = job.get("skills")
+                skills_list = []
+                if isinstance(raw_skills, list):
+                    skills_list = [str(skill).strip() for skill in raw_skills if skill and str(skill).strip()]
+                elif isinstance(raw_skills, str):
+                    skills_list = [skill.strip() for skill in raw_skills.split(",") if skill.strip()]
+                if skills_list:
+                    exp_str += f" | Skills: {', '.join(skills_list)}"
+                experience_breakdown.append(exp_str)
                 
                 if t and t != "Role" and t not in experience_fields:
                     experience_fields.append(t)
@@ -698,14 +764,35 @@ async def run_retry_fill(state: Dict[str, Any], config: RunnableConfig) -> Dict[
             first_job = work_exp[0]
             previous_company = first_job.get("company", "")
             previous_title = first_job.get("title") or first_job.get("role") or ""
-            start = first_job.get("start_date") or first_job.get("start_year")
-            end = first_job.get("end_date") or first_job.get("end_year")
+            start = first_job.get("start") or first_job.get("start_date") or first_job.get("start_year")
+            end = first_job.get("end") or first_job.get("end_date") or first_job.get("end_year")
             if start and end:
                 previous_company_tenure = f"{start} to {end}"
             elif start:
                 previous_company_tenure = f"Started {start}"
             elif end:
                 previous_company_tenure = f"Ended {end}"
+
+    # Context-aware profile slicing in retry
+    needs_detailed_profile = False
+    for field in state["pending_fields"]:
+        label = (field.get("label") or field.get("aria-label") or "").lower()
+        if field.get("type") in ("textarea", "text") and not is_contact_field(field):
+            if any(word in label for word in ["why", "describe", "explain", "project", "experience", "how", "tell", "responsibilit"]):
+                needs_detailed_profile = True
+                break
+
+    skills_list = state["profile"].get("skills", [])
+    if not needs_detailed_profile and len(skills_list) > 10:
+        skills_str = ", ".join(skills_list[:10]) + " (and others)"
+    else:
+        skills_str = ", ".join(skills_list)
+        
+    summary_str = state["profile"].get("summary", "")
+    if not needs_detailed_profile and len(summary_str) > 150:
+        summary_str = summary_str[:150] + "..."
+        
+    experience_breakdown_str = " | ".join(experience_breakdown)
 
     input_vars = {
         "full_name": state["profile"].get("full_name", ""),
@@ -716,21 +803,25 @@ async def run_retry_fill(state: Dict[str, Any], config: RunnableConfig) -> Dict[
         "total_years_experience": state["profile"].get("total_years_experience", 0),
         "total_companies": total_companies,
         "experience_fields": ", ".join(experience_fields),
-        "experience_breakdown": " | ".join(experience_breakdown),
+        "experience_breakdown": experience_breakdown_str,
         "previous_title": previous_title,
         "previous_company": previous_company,
         "previous_company_tenure": previous_company_tenure,
         "expected_salary": expected_salary,
         "notice_period": state["profile"].get("notice_period", ""),
         "work_authorization": work_auth,
+        "currently_working_status": (
+            "Currently working" if state["profile"].get("currently_working_status") is True
+            else ("Not currently working" if state["profile"].get("currently_working_status") is False else "Unknown")
+        ),
         "willing_to_relocate": "Yes" if state["profile"].get("willing_to_relocate") else "No",
-        "skills": ", ".join(state["profile"].get("skills", [])),
+        "skills": skills_str,
         "linkedin_url": state["profile"].get("linkedin_url", ""),
         "github_url": state["profile"].get("github_url", ""),
         "portfolio_url": state["profile"].get("portfolio_url", ""),
         "education": str(state["profile"].get("education", [])),
         "certifications": str(state["profile"].get("certifications", [])),
-        "summary": state["profile"].get("summary", ""),
+        "summary": summary_str,
         "qa_answers": qa_answers_str or "None available",
         "gender": state["profile"].get("gender", ""),
         "disability_status": state["profile"].get("disability_status", ""),
@@ -752,32 +843,45 @@ async def run_retry_fill(state: Dict[str, Any], config: RunnableConfig) -> Dict[
         original_messages=orig_messages,
         first_attempt_tool_calls=prev_tool_calls_payload,
         unfilled_labels=unfilled_labels,
-        new_html=html,
+        new_html=schema_str,
         step_num=state["step_number"]
     )
     
     input_tokens = 0
     output_tokens = 0
-    try:
-        response = await llm.ainvoke(messages)
-        if hasattr(response, "response_metadata") and response.response_metadata:
-            token_usage = response.response_metadata.get("token_usage", {})
-            if token_usage:
-                input_tokens = token_usage.get("prompt_tokens", 0) or token_usage.get("input_tokens", 0) or 0
-                output_tokens = token_usage.get("completion_tokens", 0) or token_usage.get("output_tokens", 0) or 0
-        tool_calls = getattr(response, "tool_calls", [])
-    except Exception as llm_err:
-        logger.error(f"[RetryFill] LLM invocation failed: {llm_err}")
-        record_step_metrics(
-            config,
-            state.get("step_number", 0),
-            "retry_fill_failed",
-            t0,
-            fields_attempted=len(state["pending_fields"]),
-            fields_filled=0,
-            error_message=str(llm_err)
-        )
-        raise llm_err
+    max_retries = 3
+    base_delay = 2.0
+    response = None
+    
+    for attempt in range(max_retries):
+        try:
+            response = await llm.ainvoke(messages)
+            if hasattr(response, "response_metadata") and response.response_metadata:
+                token_usage = response.response_metadata.get("token_usage", {})
+                if token_usage:
+                    input_tokens = token_usage.get("prompt_tokens", 0) or token_usage.get("input_tokens", 0) or 0
+                    output_tokens = token_usage.get("completion_tokens", 0) or token_usage.get("output_tokens", 0) or 0
+            tool_calls = getattr(response, "tool_calls", [])
+            break
+        except Exception as llm_err:
+            err_msg = str(llm_err).lower()
+            is_transient = any(k in err_msg for k in ["429", "rate limit", "timeout", "503", "connection"])
+            if is_transient and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"[RetryFill] Transient LLM error: {llm_err}. Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"[RetryFill] LLM invocation failed: {llm_err}")
+                record_step_metrics(
+                    config,
+                    state.get("step_number", 0),
+                    "retry_fill_failed",
+                    t0,
+                    fields_attempted=len(state["pending_fields"]),
+                    fields_filled=0,
+                    error_message=str(llm_err)
+                )
+                raise llm_err
         
     valid_calls = HallucinationGuard.validate(tool_calls, tagged_indices)
     
@@ -792,7 +896,7 @@ async def run_retry_fill(state: Dict[str, Any], config: RunnableConfig) -> Dict[
             # Save LLM-generated answer to Q&A Cache in retry step
             corresp_field = next((f for f in state["pending_fields"] if f.get("qa_idx") == qa_idx), None)
             if corresp_field:
-                q_text = extract_question_text(corresp_field, html)
+                q_text = corresp_field.get("label") or extract_question_text(corresp_field, "")
                 a_text = serialize_tool_answer(tc)
                 if q_text and a_text:
                     qa_cache_service.save_to_cache(q_text, a_text, state["user_id"], db)
@@ -802,11 +906,11 @@ async def run_retry_fill(state: Dict[str, Any], config: RunnableConfig) -> Dict[
     # Re-scan DOM to detect newly appeared (conditional) fields in retry fill
     new_accessible_fields = list(state.get("accessible_fields", []))
     try:
-        new_html = await dom.clean_and_tag(target, state["profile"])
-        if new_html:
-            scanned_fields = await dom.extract_tagged_fields(new_html)
+        new_fields = await dom.extract_structured_schema(target, state["profile"])
+        new_schema_str = dom.to_minified_schema_string(new_fields)
+        if new_schema_str:
             existing_indices = {f.get("qa_idx") for f in new_accessible_fields}
-            for sf in scanned_fields:
+            for sf in new_fields:
                 sf_idx = sf.get("qa_idx")
                 if sf_idx and sf_idx not in existing_indices:
                     new_accessible_fields.append(sf)

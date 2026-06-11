@@ -198,9 +198,10 @@ def get_extract_profile_data_prompt(resume_content: str) -> str:
             {{
                 "company": "Company Name",
                 "role": "Job Title",
-                "start": "MMM YYYY or YYYY",
-                "end": "MMM YYYY or Present",
-                "description": "1-2 sentence summary of responsibilities"
+                "start_raw": "MMM YYYY or YYYY or raw string",
+                "end_raw": "MMM YYYY or Present or raw string",
+                "skills": ["list", "of", "skills"],
+                "summary": "1-2 sentence highly concise summary focusing on key achievements and responsibilities"
             }}
         ],
         "projects": [

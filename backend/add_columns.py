@@ -15,6 +15,7 @@ def main():
         ("state_province", "VARCHAR"),
         ("postal_code", "VARCHAR"),
         ("country", "VARCHAR"),
+        ("currently_working_status", "BOOLEAN"),
     ]
     with engine.connect() as conn:
         for col_name, col_type in columns:

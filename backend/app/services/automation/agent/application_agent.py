@@ -89,10 +89,7 @@ class ApplicationAgent:
     ):
         from app.ai.agent_tools import AGENT_TOOLS
         # Bind tools to the LLM so it uses structured tool calling and wrap with retries
-        self.llm = llm.bind_tools(AGENT_TOOLS).with_retry(
-            stop_after_attempt=5,
-            wait_exponential_jitter=True
-        )
+        self.llm = llm.bind_tools(AGENT_TOOLS)
         self.dom = dom
         self.tools = tools
         self.profile = profile

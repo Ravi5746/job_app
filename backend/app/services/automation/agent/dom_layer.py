@@ -406,7 +406,11 @@ class DOMLayer:
 
     def extract_tagged_indices(self, html: str) -> set[str]:
         """Extract all data-qa-idx values. Used by HallucinationGuard."""
-        return set(re.findall(r'data-qa-idx="(\d+)"', html))
+        # Handle both HTML (data-qa-idx="1") and minified schema format (qa_idx: 1)
+        indices = re.findall(r'data-qa-idx="(\d+)"', html)
+        if not indices:
+            indices = re.findall(r'qa_idx:\s*(\d+)', html)
+        return set(indices)
 
     async def extract_tagged_fields(self, html: str) -> list[dict]:
         """Parse field metadata from minified HTML."""
@@ -433,3 +437,161 @@ class DOMLayer:
                 "label":       label_text,
             })
         return fields
+
+    async def extract_structured_schema(self, target, profile: Optional[dict] = None) -> list[dict]:
+        """
+        Extracts interactive fields from the modal viewport as structured JSON using
+        Playwright's locator attributes and accessibility guidelines.
+        """
+        modal_locator = await self.get_active_modal(target)
+        curr_target = modal_locator if modal_locator else target
+
+        # Gather profile keywords for select option filtering
+        profile_keywords = []
+        if profile:
+            for field in ["location", "phone", "phone_country_code", "email", "full_name"]:
+                val = profile.get(field, "")
+                if val:
+                    words = re.findall(r'\b\w+\b|\+\d+', str(val))
+                    profile_keywords.extend([w.lower() for w in words if len(w) > 1 or w.startswith('+')])
+            profile_keywords = list(set(profile_keywords))
+
+        try:
+            # We first run a DOM pass to ensure data-qa-idx properties are updated/injected
+            # so Playwright selectors can interact with data-qa-idx keys consistently
+            await self.clean_and_tag(target, profile)
+
+            fields = await curr_target.evaluate(
+                """(container, keywords) => {
+                    function isVisible(el) {
+                        if (!el) return false;
+                        if (el.type === 'hidden') return false;
+                        let curr = el;
+                        while (curr && curr !== document.body) {
+                            const style = window.getComputedStyle(curr);
+                            if (style.display === 'none' || style.visibility === 'hidden') return false;
+                            curr = curr.parentElement;
+                        }
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width === 0 && rect.height === 0) return false;
+                        return true;
+                    }
+
+                    const selectors = ["input", "select", "textarea"].join(",");
+                    const elements = Array.from(container.querySelectorAll(selectors));
+                    
+                    return elements.filter(isVisible).map(el => {
+                        const id = el.id || "";
+                        const name = el.name || "";
+                        const type = (el.getAttribute('type') || el.tagName.toLowerCase()).toLowerCase();
+                        const qa_idx = el.getAttribute('data-qa-idx') || "";
+                        const placeholder = el.placeholder || "";
+                        const ariaLabel = el.getAttribute('aria-label') || "";
+                        const required = el.hasAttribute('required') || el.getAttribute('aria-required') === 'true';
+                        const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
+                        
+                        // Resolve label text
+                        let labelText = "";
+                        if (id) {
+                            const labelEl = container.querySelector(`label[for="${id}"]`);
+                            if (labelEl) {
+                                labelText = labelEl.textContent.trim();
+                            }
+                        }
+                        if (!labelText) {
+                            // Try parent label
+                            let parent = el.parentElement;
+                            while (parent && parent !== container) {
+                                if (parent.tagName === 'LABEL') {
+                                    labelText = parent.textContent.trim();
+                                    break;
+                                }
+                                parent = parent.parentElement;
+                            }
+                        }
+                        
+                        // Extract select options if it's a dropdown
+                        let options = [];
+                        if (el.tagName.toLowerCase() === 'select') {
+                            const allOpts = Array.from(el.options);
+                            const originalValue = (el.value || '').toLowerCase();
+                            
+                            if (allOpts.length > 20) {
+                                const keptOpts = [];
+                                allOpts.forEach(opt => {
+                                    const text = opt.textContent.toLowerCase();
+                                    const val = (opt.getAttribute('value') || '').toLowerCase();
+                                    
+                                    if (opt.selected || opt.hasAttribute('selected') || (originalValue && (val === originalValue || text === originalValue))) {
+                                        keptOpts.push(opt.textContent.trim());
+                                        return;
+                                    }
+                                    
+                                    const matchesKeyword = keywords && keywords.some(kw => text.includes(kw) || val.includes(kw));
+                                    if (matchesKeyword) {
+                                        keptOpts.push(opt.textContent.trim());
+                                        return;
+                                    }
+                                });
+                                
+                                if (keptOpts.length < 3) {
+                                    for (let i = 0; i < Math.min(3, allOpts.length); i++) {
+                                        const text = allOpts[i].textContent.trim();
+                                        if (!keptOpts.includes(text)) {
+                                            keptOpts.push(text);
+                                        }
+                                    }
+                                }
+                                options = keptOpts;
+                            } else {
+                                options = allOpts.map(o => o.textContent.trim()).filter(Boolean);
+                            }
+                        }
+
+                        return {
+                            qa_idx: qa_idx,
+                            type: type,
+                            id: id,
+                            name: name,
+                            placeholder: placeholder,
+                            aria_label: ariaLabel,
+                            "aria-label": ariaLabel,
+                            label: labelText,
+                            required: required,
+                            disabled: disabled,
+                            checked: el.checked || false,
+                            value: el.value || "",
+                            options: options
+                        };
+                    });
+                }""",
+                profile_keywords
+            )
+            return fields
+        except Exception as e:
+            logger.error(f"[DOMLayer] extract_structured_schema failed: {e}")
+            return []
+
+    def to_minified_schema_string(self, fields: list[dict]) -> str:
+        """Serialize structured fields list to a token-efficient text format."""
+        lines = []
+        for f in fields:
+            if not f.get("qa_idx"):
+                continue
+            line = f"- qa_idx: {f['qa_idx']} | type: {f['type']}"
+            label = f.get("label") or f.get("aria_label") or f.get("placeholder") or f.get("name")
+            if label:
+                line = f"{line} | label: {label}"
+            if f.get("required"):
+                line = f"{line} | required: true"
+            if f.get("disabled"):
+                line = f"{line} | disabled: true"
+            if f.get("type") in ("checkbox", "radio"):
+                line = f"{line} | checked: {str(f['checked']).lower()}"
+            elif f.get("value"):
+                line = f"{line} | value: {f['value']}"
+            if f.get("options"):
+                line = f"{line} | options: {f['options']}"
+            lines.append(line)
+        return "\n".join(lines)
+

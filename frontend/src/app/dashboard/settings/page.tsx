@@ -76,10 +76,10 @@ interface QuestionAnswer {
 
 interface WorkExperience {
   company: string;
-  role: string;
-  start: string;
-  end: string;
-  description: string;
+  job_title: string;
+  start_date: string;
+  end_date: string;
+  summary: string;
 }
 
 interface Education {
@@ -106,7 +106,7 @@ interface ProfileData {
   portfolio_url: string;
   summary: string;
   skills: string[];
-  work_experience: WorkExperience[];
+  work_experiences: WorkExperience[];
   total_years_experience: number;
   education: Education[];
   certifications: Certification[];
@@ -115,6 +115,10 @@ interface ProfileData {
   expected_salary: string;
   notice_period: string;
   work_authorization: string;
+
+  // Employment status
+  currently_working_status?: boolean | null;
+
   requires_sponsorship?: boolean;
   country_of_citizenship?: string;
   willing_to_relocate: boolean | null;
@@ -130,6 +134,7 @@ interface ProfileData {
   questionnaire: QuestionAnswer[];
   completeness: number;
 }
+
 
 export default function SettingsPage() {
   const [activeTab, setActiveTab] = useState<'platforms' | 'profile'>('platforms');
@@ -208,7 +213,7 @@ export default function SettingsPage() {
       !!prof.summary,
       !!prof.linkedin_url,
       prof.skills.length > 0,
-      prof.work_experience.length > 0,
+      prof.work_experiences.length > 0,
       prof.education.length > 0,
       !!prof.expected_salary,
       !!prof.notice_period,
@@ -297,29 +302,29 @@ export default function SettingsPage() {
 
   const updateWorkExperience = (index: number, field: keyof WorkExperience, value: string) => {
     if (!profile) return;
-    const updated = [...profile.work_experience];
+    const updated = [...profile.work_experiences];
     updated[index] = { ...updated[index], [field]: value };
-    setProfile({ ...profile, work_experience: updated });
+    setProfile({ ...profile, work_experiences: updated });
   };
 
   const addWorkExperience = () => {
     if (!profile) return;
     const newExp: WorkExperience = {
       company: '',
-      role: '',
-      start: '',
-      end: '',
-      description: ''
+      job_title: '',
+      start_date: '',
+      end_date: '',
+      summary: ''
     };
-    const updated = [...profile.work_experience, newExp];
-    setProfile({ ...profile, work_experience: updated });
+    const updated = [...profile.work_experiences, newExp];
+    setProfile({ ...profile, work_experiences: updated });
     setEditingExpIdx(updated.length - 1);
   };
 
   const removeWorkExperience = (index: number) => {
     if (!profile) return;
-    const updated = profile.work_experience.filter((_, i) => i !== index);
-    setProfile({ ...profile, work_experience: updated });
+    const updated = profile.work_experiences.filter((_, i) => i !== index);
+    setProfile({ ...profile, work_experiences: updated });
     if (editingExpIdx === index) {
       setEditingExpIdx(null);
     } else if (editingExpIdx !== null && editingExpIdx > index) {
@@ -759,20 +764,20 @@ export default function SettingsPage() {
                     )}
 
                     {/* Experience */}
-                    <SectionHeader title="Work Experience" icon={Briefcase} section="experience" badge={`${profile.work_experience?.length || 0} positions`} />
+                    <SectionHeader title="Work Experience" icon={Briefcase} section="experience" badge={`${profile.work_experiences?.length || 0} positions`} />
                     {expandedSections.experience && (
                       <div className="space-y-4 p-4 bg-zinc-50 rounded-xl border-2 border-zinc-200 mt-2">
-                        {(!profile.work_experience || profile.work_experience.length === 0) && (
+                        {(!profile.work_experiences || profile.work_experiences.length === 0) && (
                           <p className="text-zinc-500 text-xs font-semibold">No experience data. Click Add to insert.</p>
                         )}
-                        {(profile.work_experience || []).map((exp, idx) => (
+                        {(profile.work_experiences || []).map((exp, idx) => (
                           <div key={idx} className="p-4 bg-white border-2 border-zinc-950 rounded-xl shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] space-y-3 relative">
                             {editingExpIdx === idx ? (
                               <div className="space-y-3">
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                                   <div>
                                     <label className={labelClass}>Role / Job Title</label>
-                                    <input type="text" placeholder="e.g. Senior Software Engineer" value={exp.role} onChange={e => updateWorkExperience(idx, 'role', e.target.value)} className={inputClass} />
+                                    <input type="text" placeholder="e.g. Senior Software Engineer" value={exp.job_title} onChange={e => updateWorkExperience(idx, 'job_title', e.target.value)} className={inputClass} />
                                   </div>
                                   <div>
                                     <label className={labelClass}>Company</label>
@@ -782,16 +787,16 @@ export default function SettingsPage() {
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                                   <div>
                                     <label className={labelClass}>Start Date</label>
-                                    <input type="text" placeholder="e.g. Jan 2020" value={exp.start} onChange={e => updateWorkExperience(idx, 'start', e.target.value)} className={inputClass} />
+                                    <input type="text" placeholder="e.g. Jan 2020" value={exp.start_date} onChange={e => updateWorkExperience(idx, 'start_date', e.target.value)} className={inputClass} />
                                   </div>
                                   <div>
                                     <label className={labelClass}>End Date</label>
-                                    <input type="text" placeholder="e.g. Present or Dec 2022" value={exp.end} onChange={e => updateWorkExperience(idx, 'end', e.target.value)} className={inputClass} />
+                                    <input type="text" placeholder="e.g. Present or Dec 2022" value={exp.end_date} onChange={e => updateWorkExperience(idx, 'end_date', e.target.value)} className={inputClass} />
                                   </div>
                                 </div>
                                 <div>
                                   <label className={labelClass}>Description</label>
-                                  <textarea rows={3} placeholder="Describe your key responsibilities and achievements..." value={exp.description} onChange={e => updateWorkExperience(idx, 'description', e.target.value)} className={`${inputClass} resize-none`} />
+                                  <textarea rows={3} placeholder="Describe your key responsibilities and achievements..." value={exp.summary} onChange={e => updateWorkExperience(idx, 'summary', e.target.value)} className={`${inputClass} resize-none`} />
                                 </div>
                                 <div className="flex justify-end space-x-2 pt-2">
                                   <button type="button" onClick={() => setEditingExpIdx(null)} className="px-4 py-2 bg-zinc-900 text-white font-black rounded-xl border-2 border-zinc-950 shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] hover:translate-y-[-1px] cursor-pointer text-xs">
@@ -803,9 +808,9 @@ export default function SettingsPage() {
                               <div>
                                 <div className="flex justify-between items-start">
                                   <div>
-                                    <div className="font-black text-zinc-950 text-sm">{exp.role || <span className="text-zinc-400 italic">Untitled Role</span>}</div>
+                                    <div className="font-black text-zinc-950 text-sm">{exp.job_title || <span className="text-zinc-400 italic">Untitled Role</span>}</div>
                                     <div className="text-xs font-black text-zinc-650 mt-0.5">{exp.company || <span className="text-zinc-400 italic">Unknown Company</span>}</div>
-                                    <div className="text-2xs font-bold text-zinc-400 mt-1">{exp.start || 'N/A'} - {exp.end || 'N/A'}</div>
+                                    <div className="text-2xs font-bold text-zinc-400 mt-1">{exp.start_date || 'N/A'} - {exp.end_date || 'N/A'}</div>
                                   </div>
                                   <div className="flex space-x-2">
                                     <button type="button" onClick={() => setEditingExpIdx(idx)} className="p-2 bg-white border-2 border-zinc-950 rounded-lg hover:bg-zinc-100 shadow-[1px_1px_0px_0px_rgba(0,0,0,1)] cursor-pointer" title="Edit Position">
@@ -816,7 +821,7 @@ export default function SettingsPage() {
                                     </button>
                                   </div>
                                 </div>
-                                {exp.description && <p className="text-xs text-zinc-650 mt-2 font-semibold leading-relaxed border-t border-dashed border-zinc-200 pt-2">{exp.description}</p>}
+                                {exp.summary && <p className="text-xs text-zinc-650 mt-2 font-semibold leading-relaxed border-t border-dashed border-zinc-200 pt-2">{exp.summary}</p>}
                               </div>
                             )}
                           </div>
@@ -991,6 +996,29 @@ export default function SettingsPage() {
                           <input type="text" placeholder="e.g., Authorized to work, Need Sponsorship" value={profile.work_authorization || ''}
                             onChange={e => setProfile({ ...profile, work_authorization: e.target.value })} className={inputClass} />
                         </div>
+
+                        <div>
+                          <label className={labelClass}>Current Working Status</label>
+                          <select
+                            value={profile.currently_working_status === null || profile.currently_working_status === undefined ? '' : profile.currently_working_status ? 'working' : 'not_working'}
+                            onChange={e => {
+                              const v = e.target.value;
+                              setProfile({
+                                ...profile,
+                                currently_working_status:
+                                  v === '' ? null : v === 'working'
+                                    ? true
+                                    : false,
+                              });
+                            }}
+                            className={inputClass}
+                          >
+                            <option value="">Not specified</option>
+                            <option value="working">Working</option>
+                            <option value="not_working">Not working</option>
+                          </select>
+                        </div>
+
                         <div>
                           <label className={labelClass}>Willing to Relocate</label>
                           <select value={profile.willing_to_relocate === null ? '' : profile.willing_to_relocate ? 'yes' : 'no'}
@@ -1030,6 +1058,7 @@ export default function SettingsPage() {
                         </div>
                       </div>
                     )}
+
 
                     {/* Demographics (EEO) */}
                     <SectionHeader title="Demographics (EEO)" icon={Users} section="demographics" />

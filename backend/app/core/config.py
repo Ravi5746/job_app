@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     
     OPENAI_API_KEY: str = ""
     TINYFISH_API_KEY: str = ""
+    MISTRAL_API_KEY: str = ""
     OPENAI_MODEL: str = "openai/gpt-oss-20b"
     OPENAI_MODEL_FALLBACK: str = "meta-llama/llama-3.1-8b-instruct:free"
 

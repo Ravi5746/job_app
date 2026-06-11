@@ -24,7 +24,7 @@ from app.db.session import engine, Base
 
 
 # Import models
-from app.models import user, job, resume, application, saved_job
+from app.models import user, job, resume, application, saved_job, work_experience
 
 
 # Create DB tables

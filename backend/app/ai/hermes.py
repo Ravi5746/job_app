@@ -1,4 +1,5 @@
 import re
+import os
 from typing import List, Dict
 import json
 from openai import AsyncOpenAI
@@ -15,8 +16,10 @@ class HermesAgent:
         self.model_name = model_name or settings.OPENAI_MODEL
         self.client = None
         
-        # Determine if using Groq
         is_groq = self.model_name and ("llama-" in self.model_name or "groq" in self.model_name)
+        
+        # Determine if using native Mistral API
+        is_native_mistral = self.model_name and ("mistral-small" in self.model_name or "mistral-large" in self.model_name) and "mistralai/" not in self.model_name
         
         if is_groq and settings.GROQ_API_KEY:
             self.client = AsyncOpenAI(
@@ -24,6 +27,12 @@ class HermesAgent:
                 api_key=settings.GROQ_API_KEY,
             )
             logger.info(f"HermesAgent initialized with Groq client using model: {self.model_name}")
+        elif is_native_mistral and settings.MISTRAL_API_KEY:
+            self.client = AsyncOpenAI(
+                base_url="https://api.mistral.ai/v1",
+                api_key=settings.MISTRAL_API_KEY,
+            )
+            logger.info(f"HermesAgent initialized with native Mistral client using model: {self.model_name}")
         elif settings.OPENAI_API_KEY:
             self.client = AsyncOpenAI(
                 base_url="https://openrouter.ai/api/v1",
@@ -52,59 +61,13 @@ class HermesAgent:
             return 0
 
         import datetime
-        import re
-
-        def parse_date(date_str: str, is_end: bool = False) -> datetime.date | None:
-            if not date_str:
-                return datetime.date.today() if is_end else None
-
-            date_clean = date_str.strip().lower()
-
-            if any(p in date_clean for p in ("present", "current", "now")):
-                return datetime.date.today()
-
-            MONTH_MAP = {
-                "january": 1,  "february": 2,  "march": 3,    "april": 4,
-                "may": 5,       "june": 6,      "july": 7,     "august": 8,
-                "september": 9, "october": 10,  "november": 11,"december": 12,
-                "jan": 1, "feb": 2, "mar": 3, "apr": 4,
-                "jun": 6, "jul": 7, "aug": 8, "sep": 9,
-                "oct": 10,"nov": 11,"dec": 12,
-            }
-
-            year_match = re.search(r"\b(19|20)\d{2}\b", date_str)
-            if not year_match:
-                return datetime.date.today() if is_end else None
-            year = int(year_match.group(0))
-
-            # Try named month (full names first to avoid "mar" matching "march" edge cases)
-            month = None
-            for m_name in sorted(MONTH_MAP, key=len, reverse=True):  # longest first
-                if re.search(r"\b" + re.escape(m_name) + r"\b", date_clean):
-                    month = MONTH_MAP[m_name]
-                    break
-
-            # Fallback: numeric month token (skip year digits)
-            if month is None:
-                year_str = year_match.group(0)
-                for token in re.findall(r"\b(\d{1,2})\b", date_str):
-                    if token not in (year_str, str(year)):
-                        m_val = int(token)
-                        if 1 <= m_val <= 12:
-                            month = m_val
-                            break
-
-            # Last resort
-            if month is None:
-                month = 12 if is_end else 1
-
-            return datetime.date(year, month, 1)
+        from app.services.date_normalizer import DateNormalizer
 
         # ── Step 1: Parse ──────────────────────────────────────────────────────────
         intervals: list[tuple[datetime.date, datetime.date]] = []
         for exp in work_experience:
-            start = parse_date(exp.get("start"), is_end=False)
-            end   = parse_date(exp.get("end"),   is_end=True)
+            start, _ = DateNormalizer.normalize_date(exp.get("start_raw") or exp.get("start"), is_end=False)
+            end, _   = DateNormalizer.normalize_date(exp.get("end_raw") or exp.get("end"),   is_end=True)
             if not start or not end or start > end:
                 continue
             intervals.append((start, end))
@@ -440,7 +403,7 @@ class HermesAgent:
                     for exp in result["work_experience"]:
                         company = exp.get("company")
                         role = exp.get("role")
-                        desc = exp.get("description") or ""
+                        desc = exp.get("summary") or exp.get("description") or ""
                         
                         # Identify if this entry is actually a project masquerading as a job
                         is_actually_project = False
@@ -596,6 +559,58 @@ class HermesAgent:
             if "skills" in profile_data and isinstance(profile_data["skills"], list):
                 user.skills = profile_data["skills"]
             if "work_experience" in profile_data and isinstance(profile_data["work_experience"], list):
+                from app.models.work_experience import WorkExperience
+                from app.services.date_normalizer import DateNormalizer
+                
+                existing_experiences = db.query(WorkExperience).filter(WorkExperience.user_id == user_id).all()
+                existing_map = {(e.company.lower().strip(), e.job_title.lower().strip()): e for e in existing_experiences if e.company and e.job_title}
+                
+                for exp in profile_data["work_experience"]:
+                    company = exp.get("company", "").strip()
+                    job_title = exp.get("role", "").strip()
+                    if not company or not job_title:
+                        continue
+                        
+                    start_date, _ = DateNormalizer.normalize_date(exp.get("start_raw") or exp.get("start"), is_end=False)
+                    end_date, original_end = DateNormalizer.normalize_date(exp.get("end_raw") or exp.get("end"), is_end=True)
+                    summary = exp.get("summary") or exp.get("description") or ""
+                    raw_skills = exp.get("skills")
+                    skills = None
+                    if isinstance(raw_skills, list):
+                        skills = [str(item).strip() for item in raw_skills if item is not None and str(item).strip()]
+
+                    # Fallback: if per-company skills are missing/empty,
+                    # populate them using the candidate's global skills.
+                    # This matches your UI expectation that each company has its own skill list.
+                    if skills is not None and len(skills) == 0 and profile_data.get("skills"):
+                        global_skills = profile_data.get("skills")
+                        if isinstance(global_skills, list):
+                            skills = [str(s).strip() for s in global_skills if s is not None and str(s).strip()]
+
+                    key = (company.lower(), job_title.lower())
+                    if key in existing_map:
+                        e = existing_map[key]
+                        e.start_date = start_date
+                        e.end_date = end_date
+                        e.original_end_date_str = original_end
+                        if summary:
+                            e.summary = summary
+                        if skills is not None:
+                            e.skills = skills
+                    else:
+                        new_e = WorkExperience(
+                            user_id=user_id,
+                            company=company,
+                            job_title=job_title,
+                            start_date=start_date,
+                            end_date=end_date,
+                            original_end_date_str=original_end,
+                            skills=skills or [],
+                            summary=summary
+                        )
+                        db.add(new_e)
+                
+                # Keep JSON field updated for backward compatibility
                 user.work_experience = profile_data["work_experience"]
             if "projects" in profile_data and isinstance(profile_data["projects"], list):
                 user.projects = profile_data["projects"]

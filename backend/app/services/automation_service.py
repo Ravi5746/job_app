@@ -421,6 +421,62 @@ class AutomationService:
 
         logger.info(f"[ResumeUpload] Uploading: {resume_file_path}")
 
+        async def verify_upload_complete() -> bool:
+            # 1. Wait for network requests to settle down
+            try:
+                page_obj = target if hasattr(target, "context") else target.page
+                await page_obj.wait_for_load_state("networkidle", timeout=8000)
+            except Exception as e:
+                logger.debug(f"[ResumeUpload] Networkidle wait timed out: {e}")
+
+            # 2. Wait for loading spinner / progress indicators to disappear
+            for loader_sel in [
+                ".artdeco-loader",
+                "[class*='loader']",
+                "[class*='spinner']",
+                "[class*='loading']",
+                ".ia-BasePage-loading",
+            ]:
+                try:
+                    loader = curr_target.locator(loader_sel).first
+                    if await loader.is_visible(timeout=200):
+                        logger.debug(f"[ResumeUpload] Spinner '{loader_sel}' visible, waiting for it to hide...")
+                        await loader.wait_for(state="hidden", timeout=10000)
+                except Exception:
+                    pass
+
+            # 3. Check for positive success selectors
+            success_indicators = [
+                ".jobs-document-upload-redesign-card__container--active",
+                "[class*='card--active']",
+                "[class*='card__container--active']",
+                "[class*='resume-uploaded']",
+                "[class*='upload-success']",
+                ".ia-Resume-alreadyUploaded",
+                "input[type='radio'][checked]",
+                "[aria-checked='true']",
+            ]
+            for sel in success_indicators:
+                try:
+                    el = curr_target.locator(sel).first
+                    if await el.is_visible(timeout=1000):
+                        logger.info(f"[ResumeUpload] Verified upload success via: {sel}")
+                        return True
+                except Exception:
+                    pass
+
+            # 4. Fallback text check
+            try:
+                text = (await curr_target.inner_text()).lower()
+                if any(ext in text for ext in [".pdf", ".docx", ".doc"]) or "uploaded" in text or "success" in text:
+                    logger.info("[ResumeUpload] Verified upload success via text content.")
+                    return True
+            except Exception:
+                pass
+
+            logger.warning("[ResumeUpload] Could not verify upload completion. Proceeding blindly.")
+            return False
+
         # Strategy A: direct hidden <input type="file">
         for sel in [
             "input[type='file']",
@@ -433,8 +489,8 @@ class AutomationService:
                 el = curr_target.locator(sel).first
                 if await el.count() > 0:
                     await el.set_input_files(resume_file_path)
-                    logger.info("[ResumeUpload] ✓ Via direct file-input.")
-                    await target.wait_for_timeout(2500)
+                    logger.info("[ResumeUpload] ✓ Via direct file-input. Verifying completion...")
+                    await verify_upload_complete()
                     return
             except Exception as exc:
                 logger.debug(f"[ResumeUpload] Strategy A ({sel}): {exc}")
@@ -459,8 +515,8 @@ class AutomationService:
                     await btn.click()
                 fc: FileChooser = await fc_ctx.value
                 await fc.set_files(resume_file_path)
-                logger.info("[ResumeUpload] ✓ Via file-chooser.")
-                await target.wait_for_timeout(3000)
+                logger.info("[ResumeUpload] ✓ Via file-chooser. Verifying completion...")
+                await verify_upload_complete()
                 return
             except Exception as exc:
                 logger.debug(f"[ResumeUpload] Strategy B ({sel}): {exc}")
@@ -497,6 +553,7 @@ class AutomationService:
                 await el.scroll_into_view_if_needed()
                 await el.click(timeout=1500)
                 await target.wait_for_timeout(80)
+
 
                 # Detect if element is contenteditable (e.g. LinkedIn Description field)
                 is_contenteditable = await el.evaluate(
@@ -727,7 +784,11 @@ class AutomationService:
 
         # ── Resolve element locator ────────────────────────────────────────
 
+        from app.services.automation.agent.special_handlers import LocationTypeaheadHandler
+        location_handler = LocationTypeaheadHandler()
+
         el = None
+
 
         # 1. Primary: data-qa-idx attribute
         if qa_idx:
@@ -836,6 +897,24 @@ class AutomationService:
         except Exception as e:
             logger.debug(f"[Fill] Pre-fill validation check failed: {e}")
 
+        # Location typeahead fields: prefer dedicated handler when it looks like location/city
+        if ftype != "select" and ftype != "checkbox" and ftype != "radio":
+            looks_like_location = any(
+                kw in (label or "").lower() or kw in (qa_idx or "").lower() or kw in (selector or "").lower()
+                for kw in [
+                    "location", "city", "state", "country", "zip", "postal", "address",
+                    "area", "region", "typeahead", "autocomplete"
+                ]
+            )
+            if looks_like_location and answer:
+                try:
+                    filled = await location_handler.fill(target, el, answer)
+                    if filled:
+                        return True
+                except Exception:
+                    # Fall back to generic fill
+                    pass
+
         if ftype == "select":
             return await fill_select(el)
         elif ftype == "checkbox":
@@ -845,6 +924,7 @@ class AutomationService:
         else:
             # Fallback to text fill for all other input types (e.g. text, tel, email, number, url, input, textarea)
             return await fill_text(el)
+
 
     # ═══════════════════════════════════════════════════════════════════════
     # Navigation helper
@@ -929,6 +1009,26 @@ class AutomationService:
         from app.models.user import User as UserModel
         user = db.query(UserModel).filter(UserModel.id == user_id).first()
         if user:
+            # Map work experiences from database relationship
+            db_work_exps = []
+            for exp in getattr(user, "work_experiences", []):
+                start_date_str = str(exp.start_date) if exp.start_date else ""
+                end_date_str = str(exp.end_date) if exp.end_date else ""
+                db_work_exps.append({
+                    "company": exp.company or "",
+                    "job_title": exp.job_title or "",
+                    "title": exp.job_title or "",
+                    "role": exp.job_title or "",
+                    "start_date": start_date_str,
+                    "end_date": end_date_str,
+                    "start": start_date_str,
+                    "end": end_date_str,
+                    "original_end_date_str": exp.original_end_date_str or "",
+                    "summary": exp.summary or "",
+                    "description": exp.summary or "",
+                })
+            final_work_exp = db_work_exps if db_work_exps else (user.work_experience or [])
+
             profile_data = {
                 "full_name":              user.full_name or "",
                 "email":                  user.email or "",
@@ -940,7 +1040,8 @@ class AutomationService:
                 "portfolio_url":          user.portfolio_url or "",
                 "summary":                user.summary or "",
                 "skills":                 user.skills or [],
-                "work_experience":        user.work_experience or [],
+                "work_experience":        final_work_exp,
+                "work_experiences":       final_work_exp,
                 "total_years_experience": user.total_years_experience or 0,
                 "education":              user.education or [],
                 "certifications":         user.certifications or [],
@@ -949,6 +1050,7 @@ class AutomationService:
                 "notice_period":          user.notice_period or "",
                 "work_authorization":     user.work_authorization or "",
                 "willing_to_relocate":    user.willing_to_relocate,
+                "currently_working_status": user.currently_working_status,
                 "desired_job_titles":     user.desired_job_titles or [],
                 "questionnaire_answers":  _normalize_questionnaire(user.questionnaire),
                 "gender":                 getattr(user, "gender", ""),
@@ -1152,6 +1254,7 @@ class AutomationService:
 
             llm = create_llm("smart")
             tools = ToolRegistry(self._dom, self)
+            tools.profile = profile_data
             agent = ApplicationAgent(
                 llm=llm,
                 dom=self._dom,
@@ -1238,7 +1341,7 @@ class AutomationService:
             application.status = "applied" if is_success else "failed"
             if not is_success:
                 application.notes = "Auto apply fail: Submit application button not clicked."
-                keep_page_open = True
+                keep_page_open = False
             db.commit()
 
             os.makedirs(settings.SCREENSHOTS_DIR, exist_ok=True)
@@ -1262,9 +1365,16 @@ class AutomationService:
                 "screenshot": screenshot_path,
             }
 
-        except Exception as exc:
+        except (Exception, AssertionError) as exc:
+            error_msg = str(exc)
+            is_browser_issue = any(k in error_msg.lower() for k in [
+                "closed", "crashed", "browser", "context", "assertion", "target closed"
+            ]) or isinstance(exc, AssertionError)
+            
+            friendly_message = "Auto apply failed: Browser closed or crashed." if is_browser_issue else f"Automation Error: {exc}"
+            
             logger.exception(f"Automation Error: {exc}")
-            keep_page_open = True
+            keep_page_open = False
             
             # Capture error screenshot
             if page:
@@ -1281,19 +1391,24 @@ class AutomationService:
             # Update Application database status
             try:
                 application.status = "failed"
-                application.notes = f"Automation Error: {exc}"
+                application.notes = friendly_message
                 db.commit()
             except Exception as db_err:
                 logger.error(f"Failed to update application DB status: {db_err}")
 
-            await report_progress("ERROR", f"Automation Error: {exc}")
-            return {"status": "error", "message": f"Automation Error: {exc}"}
+            await report_progress("ERROR", friendly_message)
+            return {"status": "error", "message": friendly_message}
 
 
         finally:
             try:
-                if page and not keep_page_open:
-                    await page.close()
+                if not keep_page_open:
+                    key = (user_id, platform_name)
+                    cached_context = self._active_contexts.pop(key, None)
+                    if cached_context:
+                        await cached_context.close()
+                    elif page:
+                        await page.close()
             except Exception:
                 pass
             # Clean up temp resume file
@@ -1433,3 +1548,4 @@ class AutomationService:
 
 
 automation_service = AutomationService()
+

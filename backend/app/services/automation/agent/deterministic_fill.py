@@ -29,16 +29,55 @@ DETERMINISTIC_FIELD_MAP = {
     # Salary & notice
     r"salary|compensation|ctc|pay.?expect|expected.?pay|desired.?salary": "expected_salary",
     r"notice.?period|notice|availability|start.?date|when.?can.?you.?start": "notice_period",
-    # Experience (Delegated to LLM to avoid filling total years into skill-specific questions)
+    # Simple Demographics
+    r"\bgender\b|\bsex\b": "gender",
+    r"disabilit|handicap": "disability_status",
+    r"citizen|nationality": "country_of_citizenship",
+    r"sponsor|visa.*spons": "requires_sponsorship",
     # Currently working toggle (dateRange~present checkbox)
     r"current(ly)?|i.?am.?currently|presently.?work|still.?work|end.?date.*current|this.?is.?my.?current": "currently_working",
 }
+
+
+def get_best_profile_key_match(field_text: str, profile_keys: list[str]) -> tuple[str, float]:
+    import difflib
+    best_key = ""
+    best_score = 0.0
+    
+    # Normalize field text
+    field_text_clean = field_text.lower().replace("_", " ").replace("-", " ").strip()
+    
+    for key in profile_keys:
+        key_clean = key.lower().replace("_", " ").replace("-", " ").strip()
+        
+        # Exact word match check
+        if field_text_clean == key_clean:
+            return key, 1.0
+            
+        # Character-level similarity
+        matcher = difflib.SequenceMatcher(None, field_text_clean, key_clean)
+        char_score = matcher.ratio()
+        
+        # Word token overlap (Jaccard similarity)
+        w1 = set(re.findall(r'\b\w+\b', field_text_clean))
+        w2 = set(re.findall(r'\b\w+\b', key_clean))
+        word_score = 0.0
+        if w1 and w2:
+            word_score = len(w1.intersection(w2)) / len(w1.union(w2))
+            
+        score = max(char_score, word_score)
+        if score > best_score:
+            best_score = score
+            best_key = key
+            
+    return best_key, best_score
 
 
 async def fill_if_deterministic(target, field: dict, profile: dict, fill_field_fn) -> bool:
     """
     Try to match a field against DETERMINISTIC_FIELD_MAP using
     name, id, aria-label, and placeholder attributes.
+    If no regex match, performs fuzzy token similarity matching against profile keys.
     Returns True if filled, False if LLM is needed.
     
     fill_field_fn: async function(target, field_answer_dict) -> bool
@@ -53,6 +92,15 @@ async def fill_if_deterministic(target, field: dict, profile: dict, fill_field_f
     ]
     combined = " ".join([t for t in matchable_texts if t]).lower()
 
+    # Guard: if the field asks about experience or years, delegate to LLM
+    # (except for graduation year or current working check)
+    is_exception = any(re.search(pat, combined, re.IGNORECASE) for pat in [
+        r"graduation.?year", r"year.?of.?graduation", r"degree.?year", r"completed.?year", r"currently_working"
+    ])
+    if not is_exception and any(word in combined for word in ["experience", "years", "year", "how many", "how long", "duration", "worked"]):
+        logger.info(f"[DeterministicFill] Skipping deterministic fill for potential experience field: '{combined}'")
+        return False
+
     for pattern, profile_key in DETERMINISTIC_FIELD_MAP.items():
         if re.search(pattern, combined, re.IGNORECASE):
             value = _resolve_profile_value(profile, profile_key, field.get("type", "text"))
@@ -66,14 +114,46 @@ async def fill_if_deterministic(target, field: dict, profile: dict, fill_field_f
                     "selector": "",
                 })
                 return True
+
+    # Layer 2: Fuzzy matching fallback if regex didn't match
+    profile_keys = list(profile.keys()) + [
+        "phone_country_code", "first_name", "last_name", "current_company", 
+        "current_title", "current_role", "graduation_year", "degree_type", 
+        "employment_type", "currently_working", "expected_salary"
+    ]
+    
+    for text in matchable_texts:
+        if not text:
+            continue
+        text_clean = text.lower().strip()
+        best_key, score = get_best_profile_key_match(text_clean, profile_keys)
+        if score >= 0.85:
+            value = _resolve_profile_value(profile, best_key, field.get("type", "text"))
+            if value:
+                logger.info(f"[DeterministicFill] Fuzzy matched '{text}' to profile key '{best_key}' (score: {score:.2f})")
+                await fill_field_fn(target, {
+                    "qa_idx": field["qa_idx"],
+                    "type": field.get("type", "text"),
+                    "answer": value,
+                    "label": field.get("aria-label", ""),
+                    "selector": "",
+                })
+                return True
+                
     return False
 
 
 def _resolve_profile_value(profile: dict, key: str, field_type: str = "") -> str:
     if key == "first_name":
+        first = profile.get("first_name", "").strip()
+        if first:
+            return first
         full = profile.get("full_name", "")
         return full.split()[0] if full else ""
     elif key == "last_name":
+        last = profile.get("last_name", "").strip()
+        if last:
+            return last
         full = profile.get("full_name", "")
         parts = full.split(maxsplit=1)
         return parts[1] if len(parts) > 1 else ""

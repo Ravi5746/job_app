@@ -27,7 +27,11 @@ class UserBase(BaseModel):
     gender: Optional[str] = None
     disability_status: Optional[str] = None
 
+    # Employment status
+    currently_working_status: Optional[bool] = None
+
     # Job preferences
+
     desired_job_titles: Optional[List[str]] = None
     expected_salary: Optional[str] = None
     notice_period: Optional[str] = None
@@ -55,6 +59,8 @@ class UserCreate(UserBase):
 class UserUpdate(UserBase):
     password: Optional[str] = None
 
+from .work_experience import WorkExperience as WorkExperienceSchema
+
 class UserInDBBase(UserBase):
     id: int
     created_at: datetime
@@ -63,7 +69,7 @@ class UserInDBBase(UserBase):
         from_attributes = True
 
 class User(UserInDBBase):
-    pass
+    work_experiences: Optional[List[WorkExperienceSchema]] = None
 
 
 class UserQuestionnaire(BaseModel):

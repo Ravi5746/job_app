@@ -50,6 +50,7 @@ class ClassicApplicationAgent:
         )
         self._dom = dom
         self._tools = tools
+        self._tools.profile = profile
         self._profile = profile
         self._resume_text = resume_text
         self.application_id = application_id
@@ -246,16 +247,26 @@ class ClassicApplicationAgent:
                 total_companies = len(work_exp)
                 for job in work_exp:
                     if isinstance(job, dict):
-                        t = job.get("title") or job.get("role") or "Role"
+                        t = job.get("title") or job.get("role") or job.get("job_title") or "Role"
                         comp = job.get("company") or "Company"
-                        start = str(job.get("start_date") or job.get("start_year") or "")
-                        end = str(job.get("end_date") or job.get("end_year") or "Present")
-                        tenure = f"{start}-{end}" if start else "Unknown"
+                        start = str(job.get("start") or job.get("start_date") or job.get("start_year") or "")
+                        end = str(job.get("end") or job.get("end_date") or job.get("end_year") or "Present")
+                        tenure = f"{start} to {end}" if start and end else (f"{start}-Present" if start else "Unknown")
+                        summary = job.get("summary") or job.get("description") or ""
+                        summary_clean = " ".join(summary.split())
                         
-                        experience_breakdown.append(f"{comp} ({t}, {tenure})")
-                        
-                        if t and t != "Role" and t not in experience_fields:
-                            experience_fields.append(t)
+                        exp_str = f"{comp} ({t}, {tenure})"
+                        if summary_clean:
+                            exp_str += f" - Summary: {summary_clean}"
+                raw_skills = job.get("skills")
+                skills_list = []
+                if isinstance(raw_skills, list):
+                    skills_list = [str(skill).strip() for skill in raw_skills if skill and str(skill).strip()]
+                elif isinstance(raw_skills, str):
+                    skills_list = [skill.strip() for skill in raw_skills.split(",") if skill.strip()]
+                if skills_list:
+                    exp_str += f" | Skills: {', '.join(skills_list)}"
+                    experience_fields.append(t)
                             
                 if len(work_exp) > 0 and isinstance(work_exp[0], dict):
                     first_job = work_exp[0]
@@ -435,16 +446,16 @@ class ClassicApplicationAgent:
             logger.warning(f"[Agent] Required fields still empty: {unfilled_required}")
 
         # Max retries exceeded
-        logger.error("[Agent] Max retries exceeded. Attempting blind navigation to proceed.")
-        self._state.phase = AppPhase.ADVANCING
-        is_indeed = "indeed.com" in (getattr(target, "page", target).url.lower())
-        handler = self._tools._svc.indeed_handler if is_indeed else self._tools._svc.linkedin_handler
-        await handler.click_next_or_review(target)
-        self._save_step_metrics(
-            db, step_num, "max_retries_exceeded", t_start,
-            input_tokens=input_tokens, output_tokens=output_tokens,
-            fields_attempted=record.fields_attempted, fields_filled=record.fields_filled,
-            error_message="Max retries exceeded"
-        )
-        return {"status": "continue"}
+            logger.error("[Agent] Max retries exceeded. Attempting blind navigation to proceed.")
+            self._state.phase = AppPhase.ADVANCING
+            is_indeed = "indeed.com" in (getattr(target, "page", target).url.lower())
+            handler = self._tools._svc.indeed_handler if is_indeed else self._tools._svc.linkedin_handler
+            await handler.click_next_or_review(target)
+            self._save_step_metrics(
+                db, step_num, "max_retries_exceeded", t_start,
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                fields_attempted=record.fields_attempted, fields_filled=record.fields_filled,
+                error_message="Max retries exceeded"
+            )
+            return {"status": "continue"}
 

@@ -64,9 +64,17 @@ class LinkedInHandler(BasePlatformHandler):
             has_resume_upload = False
             for sel in [
                 ".jobs-document-upload-redesign-card__container",
+                "label[class*='document-upload']",
+                "label:has-text('Upload resume')",
                 "button:has-text('Upload resume')",
                 "button:has-text('Choose file')",
                 "[data-test-resume-upload]",
+                "input[type='file']",
+                "[class*='document-upload']",
+                "[data-test-document-upload-card]",
+                "[data-testid*='resume-upload']",
+                "input[name='resume']",
+                "input[name='file']",
             ]:
                 try:
                     if await curr_target.locator(sel).count() > 0:
@@ -109,10 +117,10 @@ class LinkedInHandler(BasePlatformHandler):
                 except Exception:
                     pass
 
-            if has_questions:
-                return "questions"
             if has_resume_upload:
                 return "resume_upload"
+            if has_questions:
+                return "questions"
             if has_contact_info:
                 return "contact_info"
 
@@ -128,6 +136,10 @@ class LinkedInHandler(BasePlatformHandler):
         clicked = await self._click_first_visible(
             curr_target,
             [
+                "button:has-text('Save')",
+                "button:has-text('save')",
+                "button[aria-label*='Save']",
+                "button[aria-label*='save']",
                 "button:has-text('Next')",
                 "button:has-text('Continue')",
                 "button:has-text('Review')",

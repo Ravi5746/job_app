@@ -32,7 +32,11 @@ class User(Base):
     gender = Column(String, nullable=True)               # "Male", "Female", "Non-binary", "Decline"
     disability_status = Column(String, nullable=True)    # "Yes", "No", "Decline"
 
+    # Employment status
+    currently_working_status = Column(Boolean, nullable=True)
+
     # Job preferences (user-editable + auto-populated from questionnaire)
+
     desired_job_titles = Column(JSON, nullable=True)     # ["Full Stack Developer", "Backend Engineer"]
     expected_salary = Column(String, nullable=True)      # "12-15 LPA" or "80000"
     notice_period = Column(String, nullable=True)        # "30 days", "Immediate"
@@ -63,3 +67,6 @@ class User(Base):
     ])
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    from sqlalchemy.orm import relationship
+    work_experiences = relationship("WorkExperience", back_populates="user", cascade="all, delete-orphan")

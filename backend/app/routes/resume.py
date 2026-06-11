@@ -146,6 +146,120 @@ async def scrape_jobs_for_new_resume(resume_id: int, user_id: int, db_session_fa
     finally:
         db.close()
 
+async def enrich_profile_background(resume_id: int, user_id: int, text_content: str, db_session_factory):
+    """
+    Background task to extract profile data via LLM and upsert into the database.
+    """
+    logger.info(f"Background: Starting profile enrichment for user {user_id} and resume {resume_id}")
+    db = db_session_factory()
+    try:
+        profile_data = await hermes_agent.extract_profile_data(text_content)
+        if profile_data:
+            email = profile_data.get("email")
+            if email:
+                email_regex = r"^[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}$"
+                if not re.match(email_regex, email.strip()):
+                    profile_data.pop("email", None)
+                else:
+                    profile_data["email"] = email.strip()
+
+            phone = profile_data.get("phone")
+            if phone:
+                clean_phone = re.sub(r"[^\d+]", "", phone)
+                phone_regex = r"^\+?\d{7,15}$"
+                if not re.match(phone_regex, clean_phone):
+                    profile_data.pop("phone", None)
+                else:
+                    profile_data["phone"] = clean_phone
+
+            await hermes_agent.store_user_profile(db, user_id, profile_data)
+            logger.info(f"Background: Enriched profile data stored for user {user_id}")
+            
+            # Auto-trigger job scraping after enrichment
+            await scrape_jobs_for_new_resume(resume_id, user_id, db_session_factory)
+    except Exception as e:
+        logger.error(f"Background profile enrichment failed: {e}")
+    finally:
+        db.close()
+
+@router.post("/public-upload")
+async def public_upload_resume(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: Session = Depends(get_db)
+):
+    """Public endpoint for HR/admins to upload candidate resumes."""
+    logger.info("Received public resume upload request")
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported currently.")
+
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size exceeds 10MB limit.")
+    await file.seek(0)
+
+    try:
+        # Extract text synchronously to find email
+        file_path_temp = os.path.join(UPLOAD_DIR, f"temp_{file.filename}")
+        with open(file_path_temp, "wb") as buffer:
+            buffer.write(contents)
+            
+        reader = PdfReader(file_path_temp)
+        text_content = ""
+        for page in reader.pages:
+            text_content += page.extract_text()
+            
+        # Regex to find email
+        email_match = re.search(r"[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}", text_content)
+        if not email_match:
+            os.remove(file_path_temp)
+            raise HTTPException(status_code=400, detail="Could not extract email from resume to create candidate.")
+            
+        email = email_match.group(0).lower().strip()
+        
+        # Find or create user
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            from passlib.context import CryptContext
+            pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+            hashed_password = pwd_context.hash("TemporaryPassword123!") # Dummy password for public candidates
+            
+            # Try to get a basic name from text
+            first_line = next((line.strip() for line in text_content.splitlines() if line.strip()), "")
+            name = first_line if len(first_line.split()) >= 2 else "Unknown Candidate"
+            
+            user = User(email=email, hashed_password=hashed_password, full_name=name)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            logger.info(f"Created new candidate user with ID {user.id}")
+            
+        # Move file to proper name
+        file_filename = f"user_{user.id}_{file.filename}"
+        file_path = os.path.join(UPLOAD_DIR, file_filename)
+        os.rename(file_path_temp, file_path)
+        
+        # Create Resume
+        db_resume = ResumeModel(
+            user_id=user.id,
+            name=file.filename,
+            content=text_content,
+            file_path=file_path
+        )
+        db.add(db_resume)
+        db.commit()
+        db.refresh(db_resume)
+        
+        # Trigger background enrichment
+        background_tasks.add_task(enrich_profile_background, db_resume.id, user.id, text_content, SessionLocal)
+        
+        return {"message": "Resume uploaded successfully. Profile enrichment started.", "resume_id": db_resume.id, "user_id": user.id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in public upload: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process resume: {str(e)}")
+
 @router.post("/upload", response_model=ResumeSchema)
 async def upload_resume(
     file: UploadFile = File(...),
@@ -195,42 +309,9 @@ async def upload_resume(
         db.refresh(db_resume)
         logger.info(f"Resume record created with ID {db_resume.id}")
 
-        # 4. Extract profile data and store it (with validation)
-        # This is kept synchronous because it's fast and the user needs it immediately
-        try:
-            profile_data = await hermes_agent.extract_profile_data(text_content)
-            if profile_data:
-                # Validate email
-                email = profile_data.get("email")
-                if email:
-                    email_regex = r"^[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}$"
-                    if not re.match(email_regex, email.strip()):
-                        logger.warning(f"Invalid email extracted: {email}")
-                        profile_data.pop("email", None)
-                    else:
-                        profile_data["email"] = email.strip()
-
-                # Clean and validate phone number
-                phone = profile_data.get("phone")
-                if phone:
-                    # Sanitize: keep digits and + sign
-                    clean_phone = re.sub(r"[^\d+]", "", phone)
-                    phone_regex = r"^\+?\d{7,15}$"
-                    if not re.match(phone_regex, clean_phone):
-                        logger.warning(f"Invalid phone extracted: {phone} (cleaned: {clean_phone})")
-                        profile_data.pop("phone", None)
-                    else:
-                        profile_data["phone"] = clean_phone
-
-                # Save all extracted fields (contact + skills + experience + education)
-                await hermes_agent.store_user_profile(db, current_user.id, profile_data)
-                logger.info(f"Enriched profile data stored for user {current_user.id}")
-        except Exception as e:
-            logger.error(f"Failed to extract/store profile data: {e}")
-
-        # 5. Trigger job scraping in background (non-blocking)
-        background_tasks.add_task(scrape_jobs_for_new_resume, db_resume.id, current_user.id, SessionLocal)
-        logger.info(f"Background scraping queued for resume ID {db_resume.id}")
+        # 4. Trigger profile enrichment in background (which also triggers job scraping)
+        background_tasks.add_task(enrich_profile_background, db_resume.id, current_user.id, text_content, SessionLocal)
+        logger.info(f"Background enrichment queued for resume ID {db_resume.id}")
 
         return db_resume
     except Exception as e:
@@ -264,6 +345,7 @@ class UserProfileUpdate(BaseModel):
     # Enrichment fields
     skills: Optional[List[str]] = None
     work_experience: Optional[List[Dict[str, Any]]] = None
+    work_experiences: Optional[List[Dict[str, Any]]] = None
     projects: Optional[List[Dict[str, Any]]] = None
     total_years_experience: Optional[int] = None
     education: Optional[List[Dict[str, Any]]] = None
@@ -333,7 +415,30 @@ def _build_profile_response(user) -> dict:
         "summary": user.summary or "",
         # Enrichment data
         "skills": user.skills or [],
-        "work_experience": user.work_experience or [],
+        # Use a single work-experience source (DB relationship) to avoid duplicate rendering
+        "work_experience": [
+            {
+                "id": exp.id,
+                "company": exp.company or "",
+                "job_title": exp.job_title or "",
+                "start_date": str(exp.start_date) if exp.start_date else "",
+                "end_date": exp.original_end_date_str if exp.original_end_date_str else (str(exp.end_date) if exp.end_date else ""),
+                "skills": exp.skills or [],
+                "summary": exp.summary or "",
+            } for exp in getattr(user, 'work_experiences', [])
+        ],
+        "work_experiences": [
+            {
+                "id": exp.id,
+                "company": exp.company or "",
+                "job_title": exp.job_title or "",
+                "start_date": str(exp.start_date) if exp.start_date else "",
+                "end_date": exp.original_end_date_str if exp.original_end_date_str else (str(exp.end_date) if exp.end_date else ""),
+                "skills": exp.skills or [],
+                "summary": exp.summary or "",
+            } for exp in getattr(user, 'work_experiences', [])
+        ],
+
         "projects": user.projects or [],
         "total_years_experience": user.total_years_experience or 0,
         "education": user.education or [],
@@ -406,8 +511,28 @@ async def update_my_profile(
     # Enrichment fields
     if profile_in.skills is not None:
         current_user.skills = profile_in.skills
+    # Avoid updating JSON work_experience separately; DB relationship is the canonical source.
     if profile_in.work_experience is not None:
-        current_user.work_experience = profile_in.work_experience
+        current_user.work_experience = []
+
+    if profile_in.work_experiences is not None:
+        from app.models.work_experience import WorkExperience
+        from app.services.date_normalizer import DateNormalizer
+        db.query(WorkExperience).filter(WorkExperience.user_id == current_user.id).delete()
+        for exp in profile_in.work_experiences:
+            start_date, _ = DateNormalizer.normalize_date(exp.get("start_date") or "", is_end=False)
+            end_date, _ = DateNormalizer.normalize_date(exp.get("end_date") or "", is_end=True)
+            new_exp = WorkExperience(
+                user_id=current_user.id,
+                company=exp.get("company", ""),
+                job_title=exp.get("job_title", ""),
+                start_date=start_date,
+                end_date=end_date,
+                original_end_date_str=exp.get("end_date") or "",
+                skills=exp.get("skills") or [],
+                summary=exp.get("summary", "")
+            )
+            db.add(new_exp)
     if profile_in.projects is not None:
         current_user.projects = profile_in.projects
     if profile_in.total_years_experience is not None:
