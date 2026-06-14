@@ -31,3 +31,17 @@ class ExtractionRunResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class FieldStatsResponse(BaseModel):
+    id: int
+    canonical_name: str
+    field_type: Optional[str] = None
+    required: bool
+    ats_type: Optional[str] = None
+    company: Optional[str] = None
+    total_count: int
+
+    class Config:
+        from_attributes = True
+

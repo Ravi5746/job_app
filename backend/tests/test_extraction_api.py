@@ -108,3 +108,34 @@ def test_get_extracted_fields_by_job_id(mock_db):
     
     app.dependency_overrides.clear()
 
+
+def test_get_field_stats(mock_db):
+    app.dependency_overrides[get_db] = lambda: mock_db
+    
+    mock_stat = MagicMock()
+    mock_stat.id = 1
+    mock_stat.canonical_name = "email"
+    mock_stat.field_type = "email"
+    mock_stat.required = True
+    mock_stat.ats_type = "workday"
+    mock_stat.company = "Google"
+    mock_stat.total_count = 15
+    
+    # Setup mock query chain
+    mock_db.query.side_effect = None
+    mock_query = MagicMock()
+    mock_order = MagicMock()
+    mock_order.all.return_value = [mock_stat]
+    mock_query.order_by.return_value = mock_order
+    mock_db.query.return_value = mock_query
+    
+    response = client.get("/api/v1/extraction/stats")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 1
+    assert data[0]["canonical_name"] == "email"
+    assert data[0]["total_count"] == 15
+    
+    app.dependency_overrides.clear()
+
+

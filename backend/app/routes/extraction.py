@@ -4,8 +4,8 @@ from typing import List
 
 from app.db.session import get_db
 from app.models.job import Job
-from app.models.extraction import ExtractionRun, ExtractedField
-from app.schemas.extraction import ExtractionRunCreate, ExtractionRunResponse, ExtractedFieldResponse
+from app.models.extraction import ExtractionRun, ExtractedField, FieldStats
+from app.schemas.extraction import ExtractionRunCreate, ExtractionRunResponse, ExtractedFieldResponse, FieldStatsResponse
 from app.services.field_intelligence.extraction_tasks import run_extraction
 from app.services.field_intelligence.extractor_service import ExtractorService
 
@@ -65,4 +65,10 @@ def get_extracted_fields_by_job(job_id: int, db: Session = Depends(get_db)):
         
     fields = db.query(ExtractedField).filter(ExtractedField.run_id == run.id).all()
     return fields
+
+
+@router.get("/stats", response_model=List[FieldStatsResponse])
+def get_field_stats(db: Session = Depends(get_db)):
+    return db.query(FieldStats).order_by(FieldStats.total_count.desc()).all()
+
 
