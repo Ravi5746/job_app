@@ -12,6 +12,7 @@ from app.services.field_intelligence.ats_detector import detect_ats_dom
 from app.services.field_intelligence.submit_guard import is_submit_button
 from app.services.field_intelligence.field_classifier import classify
 from app.services.field_intelligence.fake_filler import fake_fill_field
+from app.core.config import settings
 from app.services.automation.agent.dom_layer import DOMLayer
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,10 @@ class ExtractorService:
     def __init__(self):
         self._dom_layer = DOMLayer()
 
-    async def execute(self, run_id: int):
+    async def execute(self, run_id: int, headless: Optional[bool] = None):
+        if headless is None:
+            headless = settings.HEADLESS
+            
         db = SessionLocal()
         run = db.query(ExtractionRun).filter(ExtractionRun.id == run_id).first()
         if not run:
@@ -52,7 +56,7 @@ class ExtractorService:
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(headless=headless)
                 # Create a throwaway page context
                 context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                 page = await context.new_page()
