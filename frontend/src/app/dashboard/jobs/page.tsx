@@ -3,6 +3,8 @@
 import { useState, useEffect, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import api from '@/services/api';
+import { HumanReviewModal } from '@/components/HumanReviewModal';
+
 import {
   Briefcase,
   Search,
@@ -82,6 +84,15 @@ function JobsContent() {
   const searchParams = useSearchParams();
   const [activeCategory, setActiveCategory] = useState('All');
   const [savedJobIds, setSavedJobIds] = useState<number[]>([]);
+
+  const [reviewApplicationId, setReviewApplicationId] = useState<number | null>(null);
+  const [reviewFields, setReviewFields] = useState<any[]>([]);
+  const [isReviewOpen, setIsReviewOpen] = useState(false);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [activeJobId, setActiveJobId] = useState<number | null>(null);
+  const [extractingJobId, setExtractingJobId] = useState<number | null>(null);
+  const [extractedFields, setExtractedFields] = useState<any[]>([]);
+
 
   useEffect(() => {
     const syncQuery = searchParams.get('sync');
@@ -300,6 +311,64 @@ function JobsContent() {
     }
   };
 
+  const startPolling = (taskId: string, jobId: number) => {
+    setApplyingJobId(jobId);
+    setIsApplying(true);
+    setActiveTaskId(taskId);
+    setActiveJobId(jobId);
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusRes = await api.get(`/jobs/apply/status/${taskId}`);
+        const statusData = statusRes.data;
+        const state = statusData.status;
+
+        if (state === 'NEEDS_REVIEW') {
+          clearInterval(pollInterval);
+          setApplyingJobId(null);
+          setIsApplying(false);
+          if (statusData.review_details) {
+            setReviewApplicationId(statusData.review_details.application_id);
+            setReviewFields(statusData.review_details.pending_fields || []);
+            setIsReviewOpen(true);
+          } else {
+            alert('Application paused: human input required, but no fields were returned.');
+          }
+          return;
+        }
+        
+        if (['SUCCESS', 'COMPLETED', 'WARNING', 'FAILURE', 'FAILED'].includes(state)) {
+          clearInterval(pollInterval);
+          setApplyingJobId(null);
+          setIsApplying(false);
+          setActiveTaskId(null);
+          setActiveJobId(null);
+          
+          const result = statusData.result || {};
+          if (state === 'SUCCESS' || state === 'COMPLETED') {
+            alert(`🎉 Success: ${result.message || 'Application submitted and verified!'}`);
+            if (selectedJob && selectedJob.id === jobId) {
+              setSelectedJob(prev => prev ? { ...prev, status: 'applied' } : null);
+            }
+          } else if (state === 'WARNING') {
+            alert(`⚠️ Warning: ${result.message || 'Check the application status manually.'}`);
+          } else {
+            alert(`❌ Failed: ${result.message || 'Automation failed.'}`);
+          }
+          fetchJobs();
+        }
+      } catch (pollErr) {
+        console.error('Polling error:', pollErr);
+        clearInterval(pollInterval);
+        setApplyingJobId(null);
+        setIsApplying(false);
+        setActiveTaskId(null);
+        setActiveJobId(null);
+        alert('Error occurred while checking application status.');
+      }
+    }, 2000);
+  };
+
   const handleAutoApply = async (jobId: number) => {
     try {
       setApplyingJobId(jobId);
@@ -308,39 +377,7 @@ function JobsContent() {
       const data = response.data;
       
       if (data.status === 'queued' && data.task_id) {
-        const taskId = data.task_id;
-        const pollInterval = setInterval(async () => {
-          try {
-            const statusRes = await api.get(`/jobs/apply/status/${taskId}`);
-            const statusData = statusRes.data;
-            const state = statusData.status;
-            
-            if (['SUCCESS', 'COMPLETED', 'WARNING', 'FAILURE', 'FAILED'].includes(state)) {
-              clearInterval(pollInterval);
-              setApplyingJobId(null);
-              setIsApplying(false);
-              
-              const result = statusData.result || {};
-              if (state === 'SUCCESS' || state === 'COMPLETED') {
-                alert(`🎉 Success: ${result.message || 'Application submitted and verified!'}`);
-                if (selectedJob && selectedJob.id === jobId) {
-                  setSelectedJob(prev => prev ? { ...prev, status: 'applied' } : null);
-                }
-              } else if (state === 'WARNING') {
-                alert(`⚠️ Warning: ${result.message || 'Check the application status manually.'}`);
-              } else {
-                alert(`❌ Failed: ${result.message || 'Automation failed.'}`);
-              }
-              fetchJobs();
-            }
-          } catch (pollErr) {
-            console.error('Polling error:', pollErr);
-            clearInterval(pollInterval);
-            setApplyingJobId(null);
-            setIsApplying(false);
-            alert('Error occurred while checking application status.');
-          }
-        }, 2000);
+        startPolling(data.task_id, jobId);
       } else {
         if (data.status === 'success') {
           alert(`🎉 Success: ${data.message || 'Application submitted and verified!'}`);
@@ -366,6 +403,37 @@ function JobsContent() {
       setIsApplying(false);
     }
   };
+
+  const handleExtractFields = async (jobId: number) => {
+    try {
+      setExtractingJobId(jobId);
+      // Run extraction directly (synchronous wait) so user sees instant feedback
+      const runRes = await api.post(`/extraction/run?background=false`, { job_id: jobId });
+      const runData = runRes.data;
+      
+      if (runData.status === "completed" || runData.status === "success") {
+        // Fetch the extracted fields
+        const fieldsRes = await api.get(`/extraction/run/${runData.id}/fields`);
+        setExtractedFields(fieldsRes.data);
+        alert("🎉 Successfully extracted form fields from job URL!");
+      } else {
+        alert(`❌ Extraction finished with status: ${runData.status}. Error: ${runData.error_message || 'unknown'}`);
+      }
+    } catch (error: any) {
+      console.error("Extraction failed:", error);
+      alert(error.response?.data?.detail || "Failed to extract fields.");
+    } finally {
+      setExtractingJobId(null);
+    }
+  };
+
+  const handleReviewSuccess = () => {
+    setIsReviewOpen(false);
+    if (activeTaskId && activeJobId) {
+      startPolling(activeTaskId, activeJobId);
+    }
+  };
+
 
 
   const handleDeleteJob = async (jobId: number, e?: React.MouseEvent) => {
@@ -603,8 +671,9 @@ function JobsContent() {
                       <Trash2 size={18} />
                     </button>
                     <button
-                      onClick={() => {
+                      onClick={async () => {
                         setSelectedJob(job);
+                        setExtractedFields([]);
                         fetchUserResumes();
                         if (job.tailored_resume) {
                           try {
@@ -612,6 +681,13 @@ function JobsContent() {
                           } catch (e) {
                             console.error('Failed to parse tailored resume:', e);
                           }
+                        }
+                        // Fetch already extracted fields for this job
+                        try {
+                          const fieldsRes = await api.get(`/extraction/job/${job.id}/fields`);
+                          setExtractedFields(fieldsRes.data);
+                        } catch (err) {
+                          console.error("Failed to load extracted fields:", err);
                         }
                       }}
                       className="flex items-center space-x-2 px-5 py-3 rounded-xl bg-white hover:bg-zinc-50 text-zinc-900 border-2 border-zinc-950 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] active:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] transition-all font-black text-sm cursor-pointer"
@@ -638,6 +714,31 @@ function JobsContent() {
                         <>
                           <Zap size={16} />
                           <span>Auto Apply</span>
+                        </>
+                      )}
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleExtractFields(job.id);
+                      }}
+                      disabled={extractingJobId !== null || isApplying}
+                      className={`flex items-center space-x-2 px-5 py-3.5 rounded-xl border-2 border-zinc-950 font-black transition-all shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] active:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] whitespace-nowrap text-sm cursor-pointer ${
+                        extractingJobId === job.id
+                          ? 'bg-blue-100 text-blue-700'
+                          : 'bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50'
+                      }`}
+                      title="Extract Form Fields"
+                    >
+                      {extractingJobId === job.id ? (
+                        <>
+                          <RefreshCw className="animate-spin" size={16} />
+                          <span>Extracting...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Database size={16} />
+                          <span>Extract Fields</span>
                         </>
                       )}
                     </button>
@@ -731,7 +832,7 @@ function JobsContent() {
                 </div>
               </div>
               <button
-                onClick={() => { setSelectedJob(null); setOptimizationResult(null); }}
+                onClick={() => { setSelectedJob(null); setOptimizationResult(null); setExtractedFields([]); }}
                 className="p-2.5 bg-white hover:bg-zinc-50 border-2 border-zinc-950 rounded-xl transition-all shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] cursor-pointer"
               >
                 <X size={20} className="text-zinc-900" />
@@ -827,6 +928,50 @@ function JobsContent() {
                   </h4>
                   <div className="text-zinc-800 leading-relaxed text-sm whitespace-pre-wrap bg-white p-6 rounded-2xl border-2 border-zinc-950 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)]">
                     {selectedJob.requirements}
+                  </div>
+                </div>
+              )}
+
+              {/* Extracted Fields Section */}
+              {extractedFields && extractedFields.length > 0 && (
+                <div className="space-y-4">
+                  <h4 className="text-lg font-black flex items-center space-x-2 text-zinc-900 uppercase">
+                    <Database size={20} className="text-zinc-900" />
+                    <span>Extracted Form Fields</span>
+                  </h4>
+                  <div className="bg-white p-6 rounded-2xl border-2 border-zinc-950 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] overflow-hidden">
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-sm text-zinc-800 font-medium">
+                        <thead>
+                          <tr className="border-b-2 border-zinc-950">
+                            <th className="pb-3 font-black text-zinc-950">Label</th>
+                            <th className="pb-3 font-black text-zinc-950">Type</th>
+                            <th className="pb-3 font-black text-zinc-950">Required</th>
+                            <th className="pb-3 font-black text-zinc-950">Canonical Classification</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {extractedFields.map((field) => (
+                            <tr key={field.id} className="border-b border-zinc-150 last:border-0 hover:bg-zinc-50 transition-colors">
+                              <td className="py-3 font-bold text-zinc-950">{field.label || '(No Label)'}</td>
+                              <td className="py-3 text-zinc-600 font-mono text-xs">{field.field_type}</td>
+                              <td className="py-3">
+                                {field.required ? (
+                                  <span className="bg-rose-50 border border-rose-250 text-rose-700 px-2 py-0.5 rounded text-[10px] font-black uppercase">Required</span>
+                                ) : (
+                                  <span className="bg-zinc-100 border border-zinc-200 text-zinc-500 px-2 py-0.5 rounded text-[10px] font-black uppercase">Optional</span>
+                                )}
+                              </td>
+                              <td className="py-3">
+                                <span className="bg-zinc-100 border border-zinc-300 text-zinc-800 px-2 py-0.5 rounded text-xs font-bold font-mono">
+                                  {field.canonical_name}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 </div>
               )}
@@ -985,6 +1130,28 @@ function JobsContent() {
               </button>
 
               <button
+                onClick={() => handleExtractFields(selectedJob.id)}
+                disabled={extractingJobId !== null || isApplying}
+                className={`py-4.5 px-6 rounded-xl border-2 border-zinc-950 font-black transition-all flex items-center justify-center space-x-2 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] active:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] cursor-pointer ${
+                  extractingJobId === selectedJob.id
+                    ? 'bg-blue-100 text-blue-700'
+                    : 'bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50'
+                }`}
+              >
+                {extractingJobId === selectedJob.id ? (
+                  <>
+                    <RefreshCw className="animate-spin" size={16} />
+                    <span>Extracting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Database size={16} />
+                    <span>Extract Fields</span>
+                  </>
+                )}
+              </button>
+
+              <button
                 onClick={() => handleApplyExternally(selectedJob)}
                 className="flex-1 py-4.5 px-6 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white border-2 border-zinc-950 font-black transition-all flex items-center justify-center space-x-2 shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] active:translate-x-[1px] active:translate-y-[1px] active:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] cursor-pointer"
               >
@@ -1004,6 +1171,17 @@ function JobsContent() {
           </div>
         </div>
       )}
+      {/* Human Review Modal */}
+      {isReviewOpen && reviewApplicationId && (
+        <HumanReviewModal
+          isOpen={isReviewOpen}
+          onClose={() => setIsReviewOpen(false)}
+          applicationId={reviewApplicationId}
+          pendingFields={reviewFields}
+          onResumeSuccess={handleReviewSuccess}
+        />
+      )}
     </div>
   );
 }
+
