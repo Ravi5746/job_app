@@ -5,3 +5,5 @@ from .application import Application
 from .qa_cache import QACache
 from .saved_job import SavedJob
 from .work_experience import WorkExperience
+from .extraction import ExtractionRun, ExtractedField, FieldStats
+
