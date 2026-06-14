@@ -13,7 +13,7 @@ DEFAULTS = {
 }
 
 async def fake_fill_field(locator: Locator, field: dict):
-    field_type = field.get("field_type", "text").lower()
+    field_type = (field.get("field_type") or field.get("type") or "text").lower()
     
     # 1. Input fields
     if field_type in ["text", "email", "tel", "url", "number", "textarea"]:
