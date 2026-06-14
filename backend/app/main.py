@@ -14,8 +14,10 @@ from app.routes import (
     jobs,
     resume as resume_routes,
     applications,
-    settings as settings_routes
+    settings as settings_routes,
+    extraction as extraction_routes
 )
+
 from app.core.config import settings
 from app.middleware.error_handler import error_handler_middleware
 from app.middleware.trace_id import trace_id_middleware
@@ -87,6 +89,13 @@ app.include_router(
     tags=["Settings"]
 )
 
+app.include_router(
+    extraction_routes.router,
+    prefix="/api/v1/extraction",
+    tags=["Extraction"]
+)
+
+
 
 @app.get("/")
 async def root():
@@ -103,5 +112,5 @@ if __name__ == "__main__":
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True
+        reload=False
     )
