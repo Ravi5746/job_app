@@ -17,7 +17,8 @@ import {
   Globe,
   Award,
   BookOpen,
-  GraduationCap
+  GraduationCap,
+  Database
 } from 'lucide-react';
 
 interface Job {
@@ -34,6 +35,7 @@ export default function DashboardPage() {
   const [fullUser, setFullUser] = useState<any>(user);
   const [recentJobs, setRecentJobs] = useState<Job[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [fieldStats, setFieldStats] = useState<any[]>([]);
 
   useEffect(() => {
     const fetchDashboardData = async () => {
@@ -45,6 +47,10 @@ export default function DashboardPage() {
         // Fetch recent jobs
         const jobsRes = await api.get('/jobs/', { params: { limit: 3 } });
         setRecentJobs(jobsRes.data);
+
+        // Fetch field extraction stats
+        const statsRes = await api.get('/extraction/stats');
+        setFieldStats(statsRes.data);
       } catch (error) {
         console.error('Failed to fetch dashboard data:', error);
       } finally {
@@ -265,6 +271,59 @@ export default function DashboardPage() {
           )}
 
         </div>
+      </div>
+
+      {/* Field Extraction Analytics Section */}
+      <div className="mt-10 bg-white border-2 border-zinc-950 rounded-[2rem] p-8 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
+        <div className="flex items-center space-x-3 mb-6 border-b-2 border-zinc-100 pb-4">
+          <Database size={24} className="text-zinc-950" />
+          <h3 className="text-xl font-black text-zinc-950 uppercase tracking-tight">Extracted Field Frequency Analytics</h3>
+        </div>
+        
+        {fieldStats && fieldStats.length > 0 ? (
+          <div className="overflow-hidden border-2 border-zinc-950 rounded-2xl shadow-[3px_3px_0px_0px_rgba(0,0,0,1)]">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm text-zinc-800 font-medium">
+                <thead>
+                  <tr className="bg-zinc-50 border-b-2 border-zinc-950">
+                    <th className="p-4 font-black text-zinc-950 uppercase tracking-wider text-xs">Canonical Name</th>
+                    <th className="p-4 font-black text-zinc-950 uppercase tracking-wider text-xs">Field Type</th>
+                    <th className="p-4 font-black text-zinc-950 uppercase tracking-wider text-xs">Requirement</th>
+                    <th className="p-4 font-black text-zinc-950 uppercase tracking-wider text-xs">ATS Platform</th>
+                    <th className="p-4 font-black text-zinc-950 uppercase tracking-wider text-xs">Company Context</th>
+                    <th className="p-4 font-black text-zinc-950 uppercase tracking-wider text-xs text-right">Occurrences</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {fieldStats.map((stat) => (
+                    <tr key={stat.id} className="border-b border-zinc-150 last:border-0 hover:bg-zinc-50 transition-colors">
+                      <td className="p-4 font-bold text-zinc-950">{stat.canonical_name}</td>
+                      <td className="p-4 text-zinc-600 font-mono text-xs">{stat.field_type || 'unknown'}</td>
+                      <td className="p-4">
+                        {stat.required ? (
+                          <span className="bg-rose-50 border border-rose-250 text-rose-700 px-2 py-0.5 rounded text-[10px] font-black uppercase">Required</span>
+                        ) : (
+                          <span className="bg-zinc-100 border border-zinc-200 text-zinc-500 px-2 py-0.5 rounded text-[10px] font-black uppercase">Optional</span>
+                        )}
+                      </td>
+                      <td className="p-4">
+                        <span className="bg-blue-50 border border-blue-200 text-blue-800 px-2 py-0.5 rounded text-xs font-bold font-mono">
+                          {stat.ats_type || 'generic'}
+                        </span>
+                      </td>
+                      <td className="p-4 text-zinc-650 font-semibold">{stat.company || 'All Companies'}</td>
+                      <td className="p-4 text-right font-black text-zinc-950 text-base">{stat.total_count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <div className="py-10 text-center border-2 border-dashed border-zinc-300 rounded-2xl text-zinc-500 font-bold">
+            No field extraction metrics captured yet. Statistics will appear once automated job application extractions are completed.
+          </div>
+        )}
       </div>
     </div>
   );
