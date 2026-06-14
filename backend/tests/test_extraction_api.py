@@ -68,3 +68,43 @@ def test_create_extraction_run_direct_execution(mock_db):
         mock_execute.assert_called_once_with(42)
         
     app.dependency_overrides.clear()
+
+def test_get_extracted_fields_by_job_id(mock_db):
+    app.dependency_overrides[get_db] = lambda: mock_db
+    
+    # Mock database query returned list of fields
+    mock_field = MagicMock()
+    mock_field.id = 101
+    mock_field.step_number = 1
+    mock_field.label = "First Name"
+    mock_field.field_type = "text"
+    mock_field.required = True
+    mock_field.placeholder = "Enter first name"
+    mock_field.options = None
+    mock_field.canonical_name = "first_name"
+    
+    # We want db.query(ExtractedField).filter().all() to return [mock_field]
+    # And db.query(ExtractionRun).filter().order_by().first() to return mock_run
+    def mock_query(model):
+        query_mock = MagicMock()
+        filter_mock = MagicMock()
+        if model.__name__ == "ExtractionRun":
+            order_mock = MagicMock()
+            order_mock.first.return_value = MagicMock(id=42)
+            filter_mock.order_by.return_value = order_mock
+        elif model.__name__ == "ExtractedField":
+            filter_mock.all.return_value = [mock_field]
+        query_mock.filter.return_value = filter_mock
+        return query_mock
+        
+    mock_db.query.side_effect = mock_query
+    
+    response = client.get("/api/v1/extraction/job/1/fields")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 1
+    assert data[0]["label"] == "First Name"
+    assert data[0]["canonical_name"] == "first_name"
+    
+    app.dependency_overrides.clear()
+

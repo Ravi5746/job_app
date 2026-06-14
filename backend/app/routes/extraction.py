@@ -52,3 +52,17 @@ def get_extraction_run(run_id: int, db: Session = Depends(get_db)):
 def get_extracted_fields(run_id: int, db: Session = Depends(get_db)):
     fields = db.query(ExtractedField).filter(ExtractedField.run_id == run_id).all()
     return fields
+
+@router.get("/job/{job_id}/fields", response_model=List[ExtractedFieldResponse])
+def get_extracted_fields_by_job(job_id: int, db: Session = Depends(get_db)):
+    run = db.query(ExtractionRun).filter(
+        ExtractionRun.job_id == job_id,
+        ExtractionRun.status == "completed"
+    ).order_by(ExtractionRun.created_at.desc()).first()
+    
+    if not run:
+        return []
+        
+    fields = db.query(ExtractedField).filter(ExtractedField.run_id == run.id).all()
+    return fields
+
