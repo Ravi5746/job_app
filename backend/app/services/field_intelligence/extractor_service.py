@@ -16,13 +16,7 @@ from app.services.field_intelligence.submit_guard import is_submit_button
 from app.services.field_intelligence.field_classifier import classify
 from app.services.field_intelligence.profile_filler import profile_fill_field
 from app.core.config import settings
-from app.services.automation.agent.dom_layer import DOMLayer
-from app.services.automation.indeed_handler import IndeedHandler
-from app.services.automation.linkedin_handler import LinkedInHandler
-
-class DummyAutomationContext:
-    def __init__(self, dom_layer):
-        self._dom = dom_layer
+from app.services.automation_service import AutomationService
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +41,12 @@ def compute_dom_hash(fields: List[dict], page_text_snippet: str = "") -> str:
 
 class ExtractorService:
     def __init__(self):
-        self._dom_layer = DOMLayer()
+        self.automation_service = AutomationService()
+        self._dom_layer = self.automation_service._dom
         
-        # Initialize handlers with a dummy orchestrator context
-        dummy_context = DummyAutomationContext(self._dom_layer)
         self.handlers = {
-            "indeed": IndeedHandler(dummy_context),
-            "linkedin": LinkedInHandler(dummy_context)
+            "indeed": self.automation_service.indeed_handler,
+            "linkedin": self.automation_service.linkedin_handler
         }
 
     async def execute(self, run_id: int, headless: Optional[bool] = None):
