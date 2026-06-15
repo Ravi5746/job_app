@@ -130,11 +130,10 @@ class LinkedInHandler(BasePlatformHandler):
         return "unknown"
 
     async def click_next_or_review(self, target) -> bool:
-        modal_locator = await self.service._get_active_modal(target)
-        curr_target = modal_locator if modal_locator else target
-
+        # Search the entire target instead of just modal_locator to ensure we don't miss buttons
+        # that might be rendered in sticky footers outside the main modal container.
         clicked = await self._click_first_visible(
-            curr_target,
+            target,
             [
                 "button:has-text('Save')",
                 "button:has-text('save')",
@@ -206,16 +205,26 @@ class LinkedInHandler(BasePlatformHandler):
                             next_step = await self.detect_easy_apply_step(target)
                             if next_step == "success":
                                 logger.info("[LinkedIn Review] Success screen detected!")
-                                job.status = "applied"
-                                db.commit()
                                 return True
                         except Exception:
                             pass
 
-                    # Even if success screen not detected, assume submitted if no error
-                    logger.info("[LinkedIn Review] Submit clicked — assuming success.")
-                    job.status = "applied"
-                    db.commit()
+                    # If success screen not detected, check if the submit button is still visible
+                    try:
+                        still_visible = False
+                        for s_sel in submit_selectors:
+                            btn = curr_target.locator(s_sel).first
+                            if await btn.count() > 0 and await btn.is_visible(timeout=1000):
+                                still_visible = True
+                                break
+                        if still_visible:
+                            logger.warning("[LinkedIn Review] Submit button is still visible. Assuming submission failed.")
+                            return False
+                    except Exception:
+                        pass
+
+                    # Even if success screen not detected, assume submitted if button disappeared
+                    logger.info("[LinkedIn Review] Submit clicked and button disappeared — assuming success.")
                     return True
 
                 except Exception as click_err:
@@ -316,7 +325,7 @@ class LinkedInHandler(BasePlatformHandler):
         combined_selector = ".artdeco-modal, [role='dialog'], .jobs-easy-apply-modal"
         try:
             modal_el = page.locator(combined_selector).first
-            await modal_el.wait_for(state="visible", timeout=8000)
+            await modal_el.wait_for(state="visible", timeout=5000)
             logger.info(f"[LinkedIn Apply] Easy Apply modal detected using: {combined_selector}")
             return True
         except Exception:
