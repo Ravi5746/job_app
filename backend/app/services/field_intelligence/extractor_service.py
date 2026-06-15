@@ -2,18 +2,27 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Optional, List
 from playwright.async_api import async_playwright
 
 from app.db.session import SessionLocal
 from app.models.extraction import ExtractionRun, ExtractedField, FieldStats
+from app.models.user import User
+from app.models.resume import Resume
 from app.services.field_intelligence.ats_detector import detect_ats_dom
 from app.services.field_intelligence.submit_guard import is_submit_button
 from app.services.field_intelligence.field_classifier import classify
-from app.services.field_intelligence.fake_filler import fake_fill_field
+from app.services.field_intelligence.profile_filler import profile_fill_field
 from app.core.config import settings
 from app.services.automation.agent.dom_layer import DOMLayer
+from app.services.automation.indeed_handler import IndeedHandler
+from app.services.automation.linkedin_handler import LinkedInHandler
+
+class DummyAutomationContext:
+    def __init__(self, dom_layer):
+        self._dom = dom_layer
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +48,13 @@ def compute_dom_hash(fields: List[dict], page_text_snippet: str = "") -> str:
 class ExtractorService:
     def __init__(self):
         self._dom_layer = DOMLayer()
+        
+        # Initialize handlers with a dummy orchestrator context
+        dummy_context = DummyAutomationContext(self._dom_layer)
+        self.handlers = {
+            "indeed": IndeedHandler(dummy_context),
+            "linkedin": LinkedInHandler(dummy_context)
+        }
 
     async def execute(self, run_id: int, headless: Optional[bool] = None):
         if headless is None:
@@ -50,16 +66,67 @@ class ExtractorService:
             db.close()
             return
             
+        profile_data = {}
+        resume = None
+        if run.user_id:
+            user = db.query(User).filter(User.id == run.user_id).first()
+            if user:
+                profile_data = user.to_profile_dict()
+            resume = db.query(Resume).filter(Resume.user_id == run.user_id).first()
+
         run.status = "running"
         run.started_at = datetime.utcnow()
         db.commit()
 
         try:
+            url_lower = (run.job_url or "").lower()
+            is_indeed = "indeed.com" in url_lower
+            is_linkedin = "linkedin.com" in url_lower
+            platform = "indeed" if is_indeed else ("linkedin" if is_linkedin else None)
+            handler = self.handlers.get(platform) if platform else None
+            
+            user_data_dir = None
+            if platform and run.user_id:
+                user_platform_dir = os.path.join(settings.USER_DATA_DIR, str(run.user_id), platform)
+                marker_path = os.path.join(user_platform_dir, f"connected_{platform}.txt")
+                if os.path.exists(marker_path):
+                    user_data_dir = user_platform_dir
+                    logger.info(f"Extractor: Using persistent browser context for user {run.user_id} on {platform}")
+
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=headless)
-                # Create a throwaway page context
-                context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                page = await context.new_page()
+                browser = None
+                if user_data_dir:
+                    # Pre-emptively remove stale Chromium SingletonLock file to avoid lock issues
+                    lock_file = os.path.join(user_data_dir, "SingletonLock")
+                    if os.path.exists(lock_file):
+                        try:
+                            logger.info("Extractor: Pre-emptively removing stale browser SingletonLock file")
+                            os.remove(lock_file)
+                        except Exception as e:
+                            logger.warning(f"Extractor: Could not pre-emptively remove browser SingletonLock: {e}")
+                            
+                    context = await p.chromium.launch_persistent_context(
+                        user_data_dir,
+                        headless=headless,
+                        channel="chrome",
+                        locale="en-US",
+                        args=[
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-infobars",
+                        ],
+                        viewport={"width": 1280, "height": 800},
+                        ignore_default_args=["--enable-automation"],
+                    )
+                    page = context.pages[0] if context.pages else await context.new_page()
+                else:
+                    browser = await p.chromium.launch(headless=headless)
+                    context = await browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        viewport={"width": 1280, "height": 800}
+                    )
+                    page = await context.new_page()
                 
                 # Navigate to the job listing page
                 logger.info(f"Navigating to: {run.job_url}")
@@ -72,20 +139,45 @@ class ExtractorService:
                 db.commit()
 
                 # Attempt to find apply button and transition to form page
-                apply_button = None
-                for selector in ["a:has-text('Apply')", "button:has-text('Apply')", "a:has-text('Submit')", "button:has-text('Submit')"]:
-                    loc = page.locator(selector).first
-                    if await loc.count() > 0:
-                        apply_button = loc
-                        break
-                
-                if apply_button:
-                    try:
-                        async with page.expect_navigation(timeout=10000, wait_until="networkidle"):
-                            await apply_button.click()
-                    except Exception:
+                if handler:
+                    apply_button = await handler.find_apply_button(page)
+                    if apply_button:
                         await apply_button.click()
+                        await handler.wait_for_apply_interface(page)
+                else:
+                    # Fallback generic logic for unknown platforms
+                    apply_button = None
+                    apply_selectors = [
+                        "button:has-text('Apply now')",
+                        "button:has-text('Apply Now')",
+                        "a:has-text('Apply')", 
+                        "button:has-text('Apply')", 
+                        "a:has-text('Submit')", 
+                        "button:has-text('Submit')"
+                    ]
+                    for selector in apply_selectors:
+                        try:
+                            loc = page.locator(selector).first
+                            if await loc.is_visible(timeout=2000):
+                                apply_button = loc
+                                break
+                        except Exception:
+                            continue
+                            
+                    if apply_button:
+                        try:
+                            async with page.expect_navigation(timeout=10000, wait_until="networkidle"):
+                                await apply_button.click(timeout=5000)
+                        except Exception:
+                            try:
+                                await apply_button.click(timeout=5000)
+                            except Exception as e:
+                                logger.warning(f"Could not click apply button: {e}")
                         await page.wait_for_timeout(3000)
+                    else:
+                        url_lower = page.url.lower()
+                        if "apply" not in url_lower and "application" not in url_lower:
+                            raise Exception("apply_button_not_found: No apply button visible and not on an application page.")
                 
                 step_number = 1
                 total_fields = 0
@@ -96,8 +188,14 @@ class ExtractorService:
                     # Settle wait
                     await page.wait_for_timeout(2000)
                     
+                    # Determine target (page or iframe)
+                    if handler:
+                        target, modal_locator = await handler.get_active_target(page)
+                    else:
+                        target = page
+                    
                     # Extract raw fields via DOMLayer
-                    raw_fields = await self._dom_layer.extract_structured_schema(page)
+                    raw_fields = await self._dom_layer.extract_structured_schema(target)
                     
                     # Save fields to db
                     step_field_count = 0
@@ -132,48 +230,62 @@ class ExtractorService:
                     db.commit()
                     
                     # Get page text snippet
-                    body_text = await page.inner_text("body")
+                    body_text = await target.inner_text("body")
                     current_hash = compute_dom_hash(saved_fields, body_text)
                     
-                    # Check next buttons
-                    next_button = None
-                    for text in ["next", "continue", "save & continue", "save and continue"]:
-                        loc = page.locator(f"button:has-text('{text}')").first
-                        if await loc.count() > 0:
-                            next_button = loc
+                    # Profile fill required fields on this step to progress
+                    for f in raw_fields:
+                        if f.get("required") and f.get("id"):
+                            locator = target.locator(f"#{f.get('id')}").first
+                            if await locator.count() > 0:
+                                canonical = classify(
+                                    f.get("label", ""),
+                                    f.get("name", ""),
+                                    f.get("id", ""),
+                                    f.get("placeholder", ""),
+                                    f.get("aria_label", "")
+                                )
+                                await profile_fill_field(locator, f, canonical, profile_data, resume)
+                                
+                    # Press next using the handler
+                    if handler:
+                        nav_success = await handler.click_next_or_review(target)
+                        if not nav_success:
+                            logger.info("No explicit next/continue button found by handler, stopping execution.")
                             break
-                    
-                    if next_button:
-                        btn_text = await next_button.inner_text()
-                        if is_submit_button(btn_text):
-                            logger.info("Next button is detected as a submit button! Stopping.")
-                            break
-                        
-                        # Fake fill required fields on this step to progress
-                        for f in raw_fields:
-                            if f.get("required") and f.get("id"):
-                                locator = page.locator(f"#{f.get('id')}").first
-                                if await locator.count() > 0:
-                                    await fake_fill_field(locator, f)
-                        
-                        # Press next
-                        await next_button.click()
-                        await page.wait_for_timeout(3000)
-                        
-                        new_body_text = await page.inner_text("body")
-                        new_raw_fields = await self._dom_layer.extract_structured_schema(page)
-                        new_hash = compute_dom_hash(new_raw_fields, new_body_text)
-                        
-                        if current_hash == new_hash:
-                            stuck_retries += 1
-                            if stuck_retries >= 3:
-                                raise Exception("failed_stuck: form did not change structure after multiple navigation clicks.")
-                        else:
-                            stuck_retries = 0
-                            step_number += 1
                     else:
-                        logger.info("No explicit next/continue button found, stopping execution.")
-                        break
+                        # Fallback generic navigation
+                        next_button = None
+                        for text in ["next", "continue"]:
+                            loc = target.locator(f"button:has-text('{text}')").first
+                            try:
+                                if await loc.is_visible(timeout=1000):
+                                    next_button = loc
+                                    break
+                            except Exception:
+                                pass
+                        
+                        if next_button:
+                            try:
+                                await next_button.click(timeout=5000)
+                            except Exception as e:
+                                logger.warning(f"Could not click next button: {e}")
+                            await page.wait_for_timeout(3000)
+                        else:
+                            logger.info("No explicit next/continue button found, stopping execution.")
+                            break
+                        
+                    new_body_text = await target.inner_text("body")
+                    new_raw_fields = await self._dom_layer.extract_structured_schema(target)
+                    new_hash = compute_dom_hash(new_raw_fields, new_body_text)
+                    
+                    if current_hash == new_hash:
+                        stuck_retries += 1
+                        if stuck_retries >= 3:
+                            raise Exception("failed_stuck: form did not change structure after multiple navigation clicks.")
+                    else:
+                        stuck_retries = 0
+                        step_number += 1
                 
                 run.status = "completed"
                 run.total_steps = step_number
@@ -206,7 +318,10 @@ class ExtractorService:
                         stats.total_count += 1
                 db.commit()
                 
-                await browser.close()
+                if user_data_dir:
+                    await context.close()
+                else:
+                    await browser.close()
                 
         except Exception as e:
             logger.error(f"Extraction failed: {e}")
