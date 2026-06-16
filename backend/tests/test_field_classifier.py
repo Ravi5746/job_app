@@ -17,4 +17,15 @@ def test_field_classifier():
     assert classify("Why do you want to work here?", "", "", "") == "custom_question"
     
     # 5. Fallback
-    assert classify("Random question 123", "", "", "") == "uncategorized"
+    assert classify("Random question 123", "", "", "") == "random question 123"
+    assert classify("", "", "", "") == "uncategorized"
+
+    # 6. Casing, trailing whitespace, and synonyms
+    assert classify("Resume ") == "resume"
+    assert classify("Resume\n") == "resume"
+    assert classify("履歴書/CV") == "resume"
+    assert classify("Name") == "full_name"
+    assert classify("fullname") == "full_name"
+    assert classify("téléphone") == "phone"
+    assert classify("resum") == "resume"
+

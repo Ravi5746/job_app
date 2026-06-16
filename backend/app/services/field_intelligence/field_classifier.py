@@ -34,6 +34,29 @@ CANONICAL_FIELDS = [
 ]
 
 def classify(label: str, name: str = "", field_id: str = "", placeholder: str = "", aria_label: str = "") -> str:
+    res = _core_classify(label, name, field_id, placeholder, aria_label)
+    
+    # Strictly normalize: lowercase, strip outer spacing, clean out newlines/carriage returns
+    res = res.lower().strip().replace("\n", "").replace("\r", "")
+    
+    # Semantic synonym mappings via difflib / direct matching
+    synonyms = {
+        "resume": ["resume", "cv", "履歴書/cv", "curriculum vitae", "resum"],
+        "cover_letter": ["cover_letter", "cover letter", "coverletter"],
+        "full_name": ["full_name", "fullname", "name", "your name"],
+        "phone": ["phone", "téléphone", "mobile", "cell", "telephone"],
+    }
+    
+    for canonical, variations in synonyms.items():
+        if res in variations:
+            return canonical
+        for var in variations:
+            if difflib.SequenceMatcher(None, res, var).ratio() >= 0.85:
+                return canonical
+                
+    return res
+
+def _core_classify(label: str, name: str = "", field_id: str = "", placeholder: str = "", aria_label: str = "") -> str:
     # Gather all text signals
     signals = [
         label or "",
@@ -43,8 +66,11 @@ def classify(label: str, name: str = "", field_id: str = "", placeholder: str = 
         aria_label or ""
     ]
     combined_text = " ".join(signals).lower().strip()
+    
+    fallback_name = label or name or placeholder or aria_label or field_id or "uncategorized"
+
     if not combined_text:
-        return "uncategorized"
+        return fallback_name
 
     # Layer 1: Regex via DETERMINISTIC_FIELD_MAP
     for regex_str, canonical in DETERMINISTIC_FIELD_MAP.items():
@@ -76,5 +102,5 @@ def classify(label: str, name: str = "", field_id: str = "", placeholder: str = 
         if re.search(pattern, combined_text, re.IGNORECASE):
             return category
 
-    # Layer 5: Fallback to uncategorized
-    return "uncategorized"
+    # Layer 5: Fallback to the original field name instead of 'uncategorized'
+    return fallback_name
